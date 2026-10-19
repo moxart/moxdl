@@ -20,7 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/moxart/moxdl/main/mox.py -o ~/.loca
 It needs Python 3.8 or newer. Or install with [pipx](https://pipx.pypa.io):
 
 ```bash
-pipx install git+https://github.com/moxart/moxdl.git
+pipx install moxdl
 ```
 
 On Android, in [Termux](https://termux.dev): `pkg install python`, then the `curl` line above with `$PREFIX/bin/mox` in place of `~/.local/bin/mox`.

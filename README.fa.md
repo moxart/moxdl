@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/moxart/moxdl/main/mox.py -o ~/.loca
 پایتون ۳.۸ یا جدیدتر لازم است. یا با pipx:
 
 ```bash
-pipx install git+https://github.com/moxart/moxdl.git
+pipx install moxdl
 ```
 
 روی اندروید با [Termux](https://termux.dev): اول `pkg install python`، بعد همان دستور `curl` بالا، با `$PREFIX/bin/mox` به‌جای `~/.local/bin/mox`.
