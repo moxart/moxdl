@@ -9,3 +9,6 @@ dist/
 *.part
 *.mox
 *.mox.tmp
+
+# drafts for posts and articles, not part of the project
+promo/

@@ -1,0 +1,56 @@
+name: release
+
+# Push a tag such as v1.3 to publish that version to PyPI and make a GitHub release.
+# PyPI needs a one-time setup first: see RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check the tag matches the version in the code
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          grep -q "^VERSION = \"$tag\"" mox.py || { echo "mox.py VERSION is not $tag"; exit 1; }
+          grep -q "^version = \"$tag\"" pyproject.toml || { echo "pyproject.toml version is not $tag"; exit 1; }
+      - run: python -m unittest discover -s tests
+      - run: python -m pip install build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing: no API token stored in the repo
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - run: gh release create "$GITHUB_REF_NAME" dist/* mox.py --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

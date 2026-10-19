@@ -9,6 +9,11 @@ Server paths:
     /named/<file>     sends a UTF-8 Content-Disposition file name
     /gone/<file>      403, like an expired signed link
     /alt/<file>       the same file under another URL
+    /short/<file>     closes every connection after 1 MB
+
+Every reply carries an ETag, and If-Range is honored, so a file replaced on disk counts as changed.
+
+POST /bot<token>/sendMessage stands in for the Telegram Bot API and records what it gets.
 
 There is also a small SOCKS5 proxy, with and without a password.
 """
@@ -16,10 +21,12 @@ There is also a small SOCKS5 proxy, with and without a password.
 import datetime
 import hashlib
 import importlib.util
+import io
 import os
 import random
 import re
 import select
+import shutil
 import signal
 import socket
 import socketserver
@@ -29,6 +36,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MOX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mox.py")
@@ -41,9 +49,19 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     inflight = 0
     lock = threading.Lock()
+    telegram: list = []
 
     def log_message(self, *args):
         pass
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        if re.fullmatch(r"/bot[^/]+/sendMessage", self.path):
+            Handler.telegram.append(urllib.parse.parse_qs(body))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"{}")
 
     def do_GET(self):
         with Handler.lock:
@@ -73,10 +91,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         rate = 150 * 1024 if mode == "slowconn" and random.random() < 0.3 else RATE
-        size = os.path.getsize(path)
+        info = os.stat(path)
+        size = info.st_size
+        etag = f'"{info.st_mtime_ns:x}-{size:x}"'
         start, end = 0, size - 1
         match = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range", ""))
-        if match and mode != "norange":
+        if_range = self.headers.get("If-Range")
+        if match and mode != "norange" and if_range in (None, etag):
             start = int(match.group(1))
             end = int(match.group(2)) if match.group(2) else size - 1
             if start >= size:
@@ -89,6 +110,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_response(200)
         self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("ETag", etag)
         if mode == "named":
             self.send_header("Content-Disposition",
                              "attachment; filename*=UTF-8''%DA%AF%D8%B2%D8%A7%D8%B1%D8%B4.bin")
@@ -106,6 +128,9 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
                 sent += len(chunk)
                 if mode == "flaky" and sent > 256 * 1024 and random.random() < 0.05:
+                    self.close_connection = True
+                    return
+                if mode == "short" and sent >= 1024 * 1024:
                     self.close_connection = True
                     return
                 time.sleep(len(chunk) / rate)
@@ -203,6 +228,14 @@ def sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def replace_with_random(path, size=SIZE):
+    """Write new content of the same size, the way a new release would replace a file."""
+    with open(path + ".new", "wb") as f:
+        f.write(os.urandom(size))
+    os.replace(path + ".new", path)
+    return sha256(path)
+
+
 class MoxTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -224,18 +257,38 @@ class MoxTest(unittest.TestCase):
         for server in (cls.server, cls.socks, cls.socks_auth):
             server.shutdown()
             server.server_close()
+        shutil.rmtree(cls.root, ignore_errors=True)
 
     def setUp(self):
-        self.out = tempfile.mkdtemp(prefix="mox-out-")
+        self.out = self.temp_dir("mox-out-")
+
+    def temp_dir(self, prefix):
+        """A temporary folder that is deleted after the test, pass or fail."""
+        path = tempfile.mkdtemp(prefix=prefix)
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
 
     def mox(self, *args, timeout=60):
         return subprocess.run([sys.executable, MOX, "-d", self.out, *args],
                               capture_output=True, text=True, timeout=timeout)
 
-    def assertDownloaded(self, name="big.bin"):
+    def run_mox(self, *args, timeout=60, env=None):
+        """Like mox(), without the -d option, for subcommands."""
+        return subprocess.run([sys.executable, MOX, *args], capture_output=True, text=True,
+                              timeout=timeout, env=env)
+
+    def wait_for(self, condition, timeout=20):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(0.2)
+        self.fail("timed out waiting")
+
+    def assertDownloaded(self, name="big.bin", digest=None):
         path = os.path.join(self.out, name)
         self.assertTrue(os.path.exists(path), f"{name} missing; folder has {os.listdir(self.out)}")
-        self.assertEqual(sha256(path), self.digest)
+        self.assertEqual(sha256(path), digest or self.digest)
         leftovers = [n for n in os.listdir(self.out) if n.endswith((".part", ".mox"))]
         self.assertEqual(leftovers, [])
 
@@ -390,6 +443,171 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(fresh.returncode, 0, fresh.stderr)
         self.assertIn("resumed", fresh.stderr)
         self.assertDownloaded()
+
+    def test_file_changed_while_paused(self):
+        served = os.path.join(self.root, "paused-change.bin")
+        replace_with_random(served)
+        result = self.mox(f"{self.base}/paused-change.bin", "-l", "2M", "--until", clock_in(2))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        new_digest = replace_with_random(served)
+        result = self.mox(f"{self.base}/paused-change.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("changed on the server", result.stderr)
+        self.assertDownloaded("paused-change.bin", new_digest)
+
+    def test_file_changed_while_downloading(self):
+        served = os.path.join(self.root, "live-change.bin")
+        replace_with_random(served)
+        proc = subprocess.Popen([sys.executable, MOX, "-d", self.out, "-c", "2", "-l", "2M",
+                                 f"{self.base}/short/live-change.bin"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        time.sleep(1)
+        new_digest = replace_with_random(served)
+        _, stderr = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, 1, stderr)
+        self.assertIn("changed on the server", stderr)
+        result = self.mox(f"{self.base}/short/live-change.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("started over", result.stderr)
+        self.assertDownloaded("live-change.bin", new_digest)
+
+
+    # -- piece map
+
+    def test_coverage_map(self):
+        mox = load_mox()
+        # 100 bytes in 10 cells: first piece complete, second half done and writing at byte 75.
+        cells = mox.coverage_map([(0, 50, False), (50, 25, True)], 100, 10)
+        self.assertEqual([shade for shade, _ in cells], [3, 3, 3, 3, 3, 3, 3, 2, 0, 0])
+        self.assertEqual([i for i, (_, head) in enumerate(cells) if head], [7])
+        self.assertEqual(mox.coverage_map([], 0, 10), [])
+
+    def test_display_draws_piece_map(self):
+        mox = load_mox()
+
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.status, d.total, d.done, d.name = "downloading", 1000, 300, "big.bin"
+        d.segments = [{"start": 0, "end": 499, "done": 300, "busy": True},
+                      {"start": 500, "end": 999, "done": 0, "busy": True}]
+        screen = Terminal()
+        mox.Display([d], stream=screen).draw()
+        lines = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", screen.getvalue()).splitlines()
+        self.assertIn("big.bin", lines[0])
+        self.assertTrue(lines[1].strip().startswith("█"))
+        self.assertTrue(lines[1].strip().endswith("░"))
+
+    # -- mox bench
+
+    def test_bench(self):
+        result = self.run_mox("bench", f"{self.base}/big.bin", "-s", "0.5", "-c", "4")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("supports range requests", result.stdout)
+        self.assertRegex(result.stdout, r"4 connections .*×")
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_bench_without_ranges(self):
+        result = self.run_mox("bench", f"{self.base}/norange/big.bin", "-s", "0.5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("one piece", result.stdout)
+
+    def test_bench_missing_file(self):
+        result = self.run_mox("bench", f"{self.base}/nope.bin", "-s", "0.5")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("404", result.stderr)
+
+    # -- mox resume
+
+    def test_resume_command(self):
+        result = self.mox(f"{self.base}/big.bin", "-l", "2M", "--until", clock_in(2))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        result = self.run_mox("resume", self.out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("resumed", result.stderr)
+        self.assertDownloaded()
+
+    def test_resume_with_nothing_to_do(self):
+        result = self.run_mox("resume", self.out)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("No unfinished downloads", result.stderr)
+
+    # -- --watch
+
+    def test_links_in(self):
+        mox = load_mox()
+        text = ("see https://example.com/blog/post.html and https://example.com/files/a.zip, "
+                "or (https://example.com/b.iso) https://example.com/")
+        self.assertEqual(mox.links_in(text), ["https://example.com/files/a.zip", "https://example.com/b.iso"])
+
+    def test_watch_clipboard(self):
+        clipboard = os.path.join(self.temp_dir("mox-clipboard-"), "clipboard")
+        with open(clipboard, "w") as f:
+            f.write(f"{self.base}/named/big.bin")  # already there when mox starts: must be ignored
+        env = {**os.environ, "MOX_CLIPBOARD_COMMAND": f"cat {clipboard}"}
+        proc = subprocess.Popen([sys.executable, MOX, "-d", self.out, "--watch"], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(1.5)
+            with open(clipboard, "w") as f:
+                f.write(f"copied: {self.base}/big.bin and a page {self.base}/index.html")
+            self.wait_for(lambda: os.path.exists(os.path.join(self.out, "big.bin")))
+        finally:
+            proc.send_signal(signal.SIGINT)
+            _, stderr = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertDownloaded()
+        self.assertEqual(sorted(os.listdir(self.out)), ["big.bin"])
+
+    def test_watch_without_clipboard_tool(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("MOX_CLIPBOARD_COMMAND", "WAYLAND_DISPLAY")}
+        env["PATH"] = self.temp_dir("mox-empty-path-")
+        result = self.run_mox("-d", self.out, "--watch", env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("clipboard tool", result.stderr)
+
+    # -- --notify
+
+    def test_notify(self):
+        tools = self.temp_dir("mox-tools-")
+        log = os.path.join(tools, "notify.log")
+        fake = os.path.join(tools, "notify-send")
+        with open(fake, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" >> {log}\n')
+        os.chmod(fake, 0o755)
+        env = {**os.environ, "PATH": tools + os.pathsep + os.environ["PATH"],
+               "MOX_TELEGRAM_TOKEN": "123:abc", "MOX_TELEGRAM_CHAT": "42", "MOX_TELEGRAM_API": self.base}
+        Handler.telegram.clear()
+        result = self.run_mox("-d", self.out, "--notify", f"{self.base}/big.bin", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(log) as f:
+            desktop = f.read()
+        self.assertIn("download finished", desktop)
+        self.assertIn("big.bin", desktop)
+        self.assertEqual(len(Handler.telegram), 1)
+        self.assertEqual(Handler.telegram[0]["chat_id"], ["42"])
+        self.assertIn("big.bin", Handler.telegram[0]["text"][0])
+
+    # -- library
+
+    def test_library_download(self):
+        mox = load_mox()
+        seen = []
+        path = mox.download(f"{self.base}/big.bin", self.out, progress=lambda done, total: seen.append(done))
+        self.assertEqual(path, os.path.join(self.out, "big.bin"))
+        self.assertDownloaded()
+        self.assertTrue(seen)
+        with self.assertRaises(mox.DownloadError):
+            mox.download(f"{self.base}/nope.bin", self.out)
+        with self.assertRaises(ValueError):
+            mox.download(f"{self.base}/big.bin", self.out, limit="fast")
+
+
+def argparse_namespace(directory):
+    import argparse
+    return argparse.Namespace(dir=directory, connections=4, retries=1, timeout=5, headers={}, limit=None)
 
 
 if __name__ == "__main__":

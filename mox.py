@@ -18,6 +18,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -28,7 +29,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.2"
+VERSION = "1.3"
 CHUNK = 256 * 1024
 MIN_SPLIT = 256 * 1024  # smallest piece when first dividing a file between connections
 MIN_STEAL = 64 * 1024   # smallest piece an idle connection takes over from a busy one
@@ -243,6 +244,7 @@ def configure_proxy(url: str | None) -> None:
     """Route every request through --proxy. Without it, http_proxy / https_proxy still apply."""
     global _proxy, _opener
     if not url:
+        _proxy, _opener = None, urllib.request.build_opener()
         return
     _proxy = Proxy(url)
     if _proxy.socks:
@@ -259,6 +261,7 @@ def request(url, headers, timeout, start=None, end=None):
     except urllib.error.HTTPError as e:
         if e.code in RETRYABLE_HTTP:
             raise
+        e.close()  # the error carries the open response; we are done with it
         raise FatalError(f"HTTP {e.code} {e.reason}", e.code) from None
 
 
@@ -335,8 +338,19 @@ def filename_from(resp, url: str) -> str:
     return safe_name(name) or "download"
 
 
+def validator_from(resp) -> str | None:
+    """What identifies this version of the file: a strong ETag, or failing that Last-Modified.
+
+    Weak ETags (W/"...") are useless here, since If-Range never matches them.
+    """
+    etag = resp.headers.get("ETag", "").strip()
+    if etag.startswith('"'):
+        return etag
+    return resp.headers.get("Last-Modified", "").strip() or None
+
+
 def probe(url, headers, timeout):
-    """Return (final_url, total_size_or_None, supports_ranges, filename)."""
+    """Return (final_url, total_size_or_None, supports_ranges, filename, validator_or_None)."""
     try:
         resp = request(url, headers, timeout, start=0)
     except FatalError as e:
@@ -346,13 +360,14 @@ def probe(url, headers, timeout):
     with resp:
         final = resp.geturl()
         name = filename_from(resp, final)
+        validator = validator_from(resp)
         if resp.status == 206:
             match = re.match(r"bytes\s+\d+-\d+/(\d+)", resp.headers.get("Content-Range", ""))
             if match:
-                return final, int(match.group(1)), True, name
+                return final, int(match.group(1)), True, name, validator
         length = resp.headers.get("Content-Length", "")
         total = int(length) if length.isdigit() and resp.status == 200 else None
-        return final, total, False, name
+        return final, total, False, name, validator
 
 
 if hasattr(os, "pwrite"):
@@ -414,6 +429,7 @@ class Download:
         self.total: int | None = None
         self.done = 0
         self.ranges = False
+        self.validator: str | None = None
         self.active = 0
         self.path: str | None = None
         self.segments: list[dict] = []
@@ -439,6 +455,11 @@ class Download:
         except Exception as e:  # keep one broken download from killing the rest
             self.status, self.message = "error", f"{type(e).__name__}: {e}"
 
+    def pieces(self) -> list[tuple[int, int, bool]]:
+        """(start, bytes done, busy) for every piece, for drawing the map."""
+        with self.lock:
+            return [(s["start"], s["done"], bool(s.get("busy"))) for s in self.segments]
+
     def speed(self) -> float:
         now = time.monotonic()
         self.samples.append((now, self.done))
@@ -455,7 +476,7 @@ class Download:
         if info is None:
             self.status = "paused"
             return
-        self.final_url, self.total, self.ranges, server_name = info
+        self.final_url, self.total, self.ranges, server_name, self.validator = info
         if not self.custom_name:
             self.name = server_name
         self.path = self._choose_path()
@@ -560,6 +581,12 @@ class Download:
                 state = json.load(f)
             if state.get("total") != self.total or os.path.getsize(part_path) != self.total:
                 return None
+            # Same size is not proof of the same file: a new release can keep the size.
+            # Without a validator on either side, the size check is all there is.
+            saved = state.get("validator")
+            if saved and self.validator and saved != self.validator:
+                self.message = "changed on the server, started over"
+                return None
             return [{"start": int(s["start"]), "end": int(s["end"]), "done": int(s["done"])}
                     for s in state["segments"]]
         except (OSError, ValueError, KeyError, TypeError):
@@ -570,7 +597,8 @@ class Download:
             return
         with self.lock:
             segments = [{k: s[k] for k in ("start", "end", "done")} for s in self.segments]
-        state = {"version": 1, "url": self.url, "total": self.total, "segments": segments}
+        state = {"version": 1, "url": self.url, "total": self.total, "validator": self.validator,
+                 "segments": segments}
         tmp = state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f)
@@ -697,10 +725,13 @@ class Download:
     def _open_range(self, link: KeepAlive | None, start, end):
         if not self.ranges:
             return request(self.final_url, self.opts.headers, self.opts.timeout)
+        # If-Range makes the server send the whole new file instead of a piece of it
+        # when the file has changed, so pieces of two versions never get mixed.
+        headers = {**self.opts.headers, "If-Range": self.validator} if self.validator else self.opts.headers
         if link is None:  # going through a proxy: let urllib handle it
-            resp = request(self.final_url, self.opts.headers, self.opts.timeout, start, end)
+            resp = request(self.final_url, headers, self.opts.timeout, start, end)
         else:
-            resp = link.get(build_headers(self.opts.headers, start, end))
+            resp = link.get(build_headers(headers, start, end))
             if resp.status != 206:
                 link.close()
                 if resp.status in RETRYABLE_HTTP:
@@ -708,6 +739,9 @@ class Download:
                 if resp.status != 200:
                     raise FatalError(f"HTTP {resp.status} {resp.reason}", resp.status)
         if resp.status != 206:
+            resp.close()
+            if self.validator:
+                raise FatalError("the file changed on the server; run again to start over")
             raise FatalError("server stopped honoring range requests")
         return resp
 
@@ -841,11 +875,36 @@ STYLE = {  # status: (icon, ANSI color)
 }
 
 
+MAP_SHADES = "░▒▓█"  # nothing, some, most, all of a cell's bytes downloaded
+
+
+def coverage_map(pieces: list[tuple[int, int, bool]], total: int, width: int) -> list[tuple[int, bool]]:
+    """Split the file into `width` cells. For each: a shade index into MAP_SHADES, and whether a
+    connection is writing inside it right now."""
+    if not total or width <= 0:
+        return []
+    cell = total / width
+    filled = [0.0] * width
+    heads = [False] * width
+    for start, done, busy in pieces:
+        end = start + done  # bytes [start, end) are on disk
+        if done > 0:
+            for i in range(int(start // cell), min(width - 1, int((end - 1) // cell)) + 1):
+                overlap = min(end, (i + 1) * cell) - max(start, i * cell)
+                if overlap > 0:
+                    filled[i] += overlap / cell
+        if busy and end < total:
+            heads[min(width - 1, int(end // cell))] = True
+    shades = [3 if f >= 0.999 else 2 if f >= 0.5 else 1 if f > 0 else 0 for f in filled]
+    return list(zip(shades, heads))
+
+
 class Display:
-    def __init__(self, downloads: list[Download], stream=sys.stderr):
+    def __init__(self, downloads: list[Download], stream=sys.stderr, watching: bool = False):
         self.downloads = downloads
         self.stream = stream
         self.tty = stream.isatty()
+        self.watching = watching
         self.drawn = 0
         self.reported: dict[int, str] = {}
 
@@ -855,7 +914,15 @@ class Display:
             return
         size = shutil.get_terminal_size((100, 24))
         width = size.columns - 1
-        rows = [self._row(d, width) for d in self._visible(max(1, size.lines - 2))]
+        visible = self._visible(max(1, size.lines - 2))
+        mapped = [d for d in visible if d.status == "downloading" and d.total]
+        # Each active download gets a second line with its piece map, when the screen has room.
+        with_maps = len(visible) + len(mapped) + 1 <= size.lines - 1
+        rows = []
+        for d in visible:
+            rows.append(self._row(d, width))
+            if with_maps and d in mapped:
+                rows.append(self._map_row(d, width))
         rows.append(self._summary(width))
         out = ["\x1b[?25l"]
         if self.drawn:
@@ -914,6 +981,18 @@ class Display:
                 (right, ""), (clip(tail, tail_width), "2" if d.status != "downloading" else "")]
         return fit(line, width)
 
+    @staticmethod
+    def _map_row(d: Download, width: int) -> str:
+        parts: list[tuple[str, str]] = [("  ", "")]
+        for shade, head in coverage_map(d.pieces(), d.total, width - 3):
+            color = "1;97" if head else ("36" if shade else "2")
+            char = MAP_SHADES[shade]
+            if parts[-1][1] == color:
+                parts[-1] = (parts[-1][0] + char, color)
+            else:
+                parts.append((char, color))
+        return fit(parts, width)
+
     def _summary(self, width: int) -> str:
         counts: dict[str, int] = {}
         for d in self.downloads:
@@ -925,7 +1004,9 @@ class Display:
             parts.append(f"{counts['error']} failed")
         if speed:
             parts.append(f"{human_size(speed)}/s total")
-        if any(d.status in ("waiting", "connecting", "downloading") for d in self.downloads):
+        if self.watching:
+            parts.append("watching the clipboard for links · Ctrl+C to stop")
+        elif any(d.status in ("waiting", "connecting", "downloading") for d in self.downloads):
             parts.append("Ctrl+C to pause")
         return fit([("  " + " · ".join(parts), "2")], width)
 
@@ -950,29 +1031,69 @@ def fit(parts: list[tuple[str, str]], width: int) -> str:
 
 # ---------------------------------------------------------------- CLI
 
-def parse_args(argv):
-    parser = argparse.ArgumentParser(
-        prog="mox", description="Fast, resumable, multi-connection downloads in the terminal.",
-        epilog="Interrupted downloads resume automatically: run the same command again.")
-    parser.add_argument("urls", nargs="*", metavar="URL")
-    parser.add_argument("-i", "--input", metavar="FILE", help="read URLs from FILE, one per line ('-' for stdin)")
-    parser.add_argument("-d", "--dir", default=".", help="directory to save into (default: current)")
-    parser.add_argument("-o", "--output", metavar="NAME", help="file name to save as (single URL only)")
+def add_network_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-t", "--timeout", type=float, default=30, help="network timeout in seconds (default: 30)")
+    parser.add_argument("-H", "--header", action="append", default=[], metavar="'NAME: VALUE'",
+                        help="extra request header, e.g. cookie or referer (repeatable)")
+    parser.add_argument("-x", "--proxy", metavar="URL",
+                        help="proxy for every request: socks5://host:port, socks5h://... or http://host:port")
+
+
+def add_download_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-c", "--connections", type=int, default=DEFAULT_CONNECTIONS,
                         help=f"connections per file, up to {MAX_CONNECTIONS} (default: {DEFAULT_CONNECTIONS})")
     parser.add_argument("-j", "--jobs", type=int, default=3, help="files downloaded at once (default: 3)")
     parser.add_argument("-l", "--limit", type=parse_rate, metavar="RATE", help="total speed limit, e.g. 500K or 2M")
     parser.add_argument("-r", "--retries", type=int, default=10, help="retries per connection (default: 10)")
-    parser.add_argument("-t", "--timeout", type=float, default=30, help="network timeout in seconds (default: 30)")
-    parser.add_argument("-H", "--header", action="append", default=[], metavar="'NAME: VALUE'",
-                        help="extra request header, e.g. cookie or referer (repeatable)")
-    parser.add_argument("--sha256", metavar="HEX", help="verify the file against this checksum (single URL only)")
-    parser.add_argument("-x", "--proxy", metavar="URL",
-                        help="proxy for every request: socks5://host:port, socks5h://... or http://host:port")
+    add_network_options(parser)
     parser.add_argument("--at", type=parse_clock, metavar="HH:MM",
                         help="wait until this time of day before starting")
     parser.add_argument("--until", type=parse_clock, metavar="HH:MM",
                         help="pause at this time of day; with --at, carry on at the next --at, day after day")
+    parser.add_argument("-n", "--notify", action="store_true",
+                        help="when downloads end, send a desktop notification, and a Telegram message "
+                             "if MOX_TELEGRAM_TOKEN and MOX_TELEGRAM_CHAT are set")
+
+
+def check_network_options(parser: argparse.ArgumentParser, args) -> None:
+    if args.proxy:
+        try:
+            Proxy(args.proxy)
+        except ValueError as e:
+            parser.error(str(e))
+    headers = {}
+    for header in args.header:
+        name, sep, value = header.partition(":")
+        if not sep or not name.strip():
+            parser.error(f"bad header {header!r}, expected 'Name: value'")
+        headers[name.strip()] = value.strip()
+    args.headers = headers
+
+
+def check_download_options(parser: argparse.ArgumentParser, args) -> None:
+    if not 1 <= args.connections <= MAX_CONNECTIONS:
+        parser.error(f"--connections must be between 1 and {MAX_CONNECTIONS}")
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+    if args.at is not None and args.at == args.until:
+        parser.error("--at and --until must differ")
+    check_network_options(parser, args)
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="mox", description="Fast, resumable, multi-connection downloads in the terminal.",
+        epilog="Interrupted downloads resume automatically: run the same command again. "
+               "Other commands: 'mox resume [DIR]' continues every unfinished download in a folder, "
+               "'mox bench URL' measures how much faster many connections are.")
+    parser.add_argument("urls", nargs="*", metavar="URL")
+    parser.add_argument("-i", "--input", metavar="FILE", help="read URLs from FILE, one per line ('-' for stdin)")
+    parser.add_argument("-d", "--dir", default=".", help="directory to save into (default: current)")
+    parser.add_argument("-o", "--output", metavar="NAME", help="file name to save as (single URL only)")
+    parser.add_argument("--sha256", metavar="HEX", help="verify the file against this checksum (single URL only)")
+    parser.add_argument("-w", "--watch", action="store_true",
+                        help="keep running and download every file link you copy to the clipboard")
+    add_download_options(parser)
     parser.add_argument("-V", "--version", action="version", version=f"mox {VERSION}")
     args = parser.parse_args(argv)
 
@@ -982,29 +1103,13 @@ def parse_args(argv):
         with source:
             urls += [line.strip() for line in source if line.strip() and not line.lstrip().startswith("#")]
     urls = [u if "://" in u else "https://" + u for u in dict.fromkeys(urls)]
-    if not urls:
-        parser.error("give at least one URL (or -i FILE)")
-    if len(urls) > 1 and (args.output or args.sha256):
+    if not urls and not args.watch:
+        parser.error("give at least one URL (or -i FILE, or --watch)")
+    if (len(urls) > 1 or args.watch) and (args.output or args.sha256):
         parser.error("--output and --sha256 work with a single URL only")
-    if not 1 <= args.connections <= MAX_CONNECTIONS:
-        parser.error(f"--connections must be between 1 and {MAX_CONNECTIONS}")
-    if args.jobs < 1:
-        parser.error("--jobs must be at least 1")
-    if args.at is not None and args.at == args.until:
-        parser.error("--at and --until must differ")
-    if args.proxy:
-        try:
-            Proxy(args.proxy)
-        except ValueError as e:
-            parser.error(str(e))
-
-    headers = {}
-    for header in args.header:
-        name, sep, value = header.partition(":")
-        if not sep or not name.strip():
-            parser.error(f"bad header {header!r}, expected 'Name: value'")
-        headers[name.strip()] = value.strip()
-    args.headers = headers
+    if args.watch and (args.at or args.until):
+        parser.error("--watch cannot be combined with --at or --until")
+    check_download_options(parser, args)
     args.urls = urls
     return args
 
@@ -1055,7 +1160,86 @@ def wait_until(moment: datetime.datetime) -> bool:
     return True
 
 
-# ---------------------------------------------------------------- main
+# ---------------------------------------------------------------- notifications
+
+def notify(title: str, body: str) -> None:
+    """Desktop notification where a tool for it exists, plus Telegram when configured.
+
+    A notification that fails only prints a warning: it never changes the exit code.
+    """
+    token, chat = os.environ.get("MOX_TELEGRAM_TOKEN"), os.environ.get("MOX_TELEGRAM_CHAT")
+    if token and chat:
+        # MOX_TELEGRAM_API points at a self-hosted Bot API server, if you run one.
+        api = os.environ.get("MOX_TELEGRAM_API", "https://api.telegram.org").rstrip("/")
+        data = urllib.parse.urlencode({"chat_id": chat, "text": f"{title}\n{body}"}).encode()
+        try:
+            _opener.open(urllib.request.Request(f"{api}/bot{token}/sendMessage", data=data), timeout=15).close()
+        except (OSError, http.client.HTTPException) as e:
+            print(f"! Telegram notification failed: {reason(e)}", file=sys.stderr)
+    for command in (["notify-send", "--app-name=mox", title, body],
+                    ["termux-notification", "--title", title, "--content", body],
+                    ["osascript", "-e", f"display notification {json.dumps(body)} with title {json.dumps(title)}"]):
+        if shutil.which(command[0]):
+            try:
+                subprocess.run(command, capture_output=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            break
+
+
+def notify_summary(downloads: list[Download], outcome: str) -> None:
+    done = [d for d in downloads if d.status == "done"]
+    failed = [d for d in downloads if d.status == "error"]
+    unfinished = [d for d in downloads if d.status in ("paused", "waiting")]
+    if outcome == "deadline" and unfinished:
+        title = f"mox stopped as scheduled, {len(unfinished)} unfinished"
+    elif failed:
+        title = f"mox: {len(done)} done, {len(failed)} failed"
+    else:
+        title = "mox: all downloads finished" if len(done) != 1 else "mox: download finished"
+    names = [d.name for d in done + failed][:5]
+    more = len(done) + len(failed) - len(names)
+    notify(title, "\n".join(names) + (f"\nand {more} more" if more > 0 else ""))
+
+
+# ---------------------------------------------------------------- clipboard
+
+URL_PATTERN = re.compile(r"https?://[^\s<>\"'`]+")
+PAGE_EXTENSIONS = {"", ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".cgi"}
+CLIPBOARD_POLL = 1.0  # seconds between clipboard reads in --watch mode
+
+
+def clipboard_command() -> list[str] | None:
+    custom = os.environ.get("MOX_CLIPBOARD_COMMAND")
+    if custom:
+        return shlex.split(custom)
+    candidates = [["wl-paste", "--no-newline"]] if os.environ.get("WAYLAND_DISPLAY") else []
+    candidates += [["xclip", "-o", "-selection", "clipboard"], ["xsel", "--clipboard", "--output"],
+                   ["pbpaste"], ["termux-clipboard-get"],
+                   ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"]]
+    return next((c for c in candidates if shutil.which(c[0])), None)
+
+
+def read_clipboard(command: list[str]) -> str:
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def links_in(text: str) -> list[str]:
+    """File links in a piece of text. Links to web pages are skipped: copying the address of
+    an article should not download its HTML."""
+    links = []
+    for url in URL_PATTERN.findall(text):
+        url = url.rstrip(".,;:)]}>")
+        name = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+        if os.path.splitext(name)[1].lower() not in PAGE_EXTENSIONS:
+            links.append(url)
+    return links
+
+
+# ---------------------------------------------------------------- running downloads
 
 def run_session(downloads: list[Download], args, limiter: RateLimiter, deadline) -> str:
     """Run every waiting download. Returns 'finished', 'interrupted' or 'deadline'."""
@@ -1086,6 +1270,47 @@ def run_session(downloads: list[Download], args, limiter: RateLimiter, deadline)
     return outcome
 
 
+def watch_session(downloads: list[Download], args, limiter: RateLimiter, command: list[str]) -> str:
+    """Download what is given, then every new file link that shows up on the clipboard."""
+    _claimed_paths.clear()
+    seen = {d.url for d in downloads} | set(links_in(read_clipboard(command)))  # not what was there before
+    stop = threading.Event()
+    display = Display(downloads, watching=True)
+    pool = ThreadPoolExecutor(max_workers=args.jobs)
+    futures = [pool.submit(d.run, stop, limiter) for d in downloads]
+    announced: set[int] = set()
+    last_poll = 0.0
+    try:
+        try:
+            while True:
+                if time.monotonic() - last_poll >= CLIPBOARD_POLL:
+                    last_poll = time.monotonic()
+                    for url in links_in(read_clipboard(command)):
+                        if url not in seen:
+                            seen.add(url)
+                            d = Download(url, args)
+                            downloads.append(d)
+                            futures.append(pool.submit(d.run, stop, limiter))
+                if args.notify:
+                    for d in downloads:
+                        if d.status in ("done", "error") and id(d) not in announced:
+                            announced.add(id(d))
+                            notify("mox: download finished" if d.status == "done" else "mox: download failed",
+                                   d.name if d.status == "done" else f"{d.name}: {d.message}")
+                display.draw()
+                time.sleep(FRAME_INTERVAL)
+        except KeyboardInterrupt:
+            stop.set()
+            while not all(f.done() for f in futures):
+                display.draw()
+                time.sleep(0.1)
+        pool.shutdown(wait=True)
+        display.draw()
+    finally:
+        display.close()
+    return "interrupted" if any(d.status in ("paused", "waiting") for d in downloads) else "finished"
+
+
 def expired_link_hint(d: Download) -> str:
     folder = os.path.dirname(d.path) if d.path else d.opts.dir
     return ("  If this link worked before, it has probably expired. Get a fresh link and run\n"
@@ -1093,12 +1318,29 @@ def expired_link_hint(d: Download) -> str:
             "  to continue from where it stopped.")
 
 
-def main(argv=None) -> int:
-    args = parse_args(argv)
-    configure_proxy(args.proxy)
-    downloads = [Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
-    limiter = RateLimiter(args.limit)
+def report(downloads: list[Download], outcome: str, args) -> int:
+    failed = [d for d in downloads if d.status == "error"]
+    unfinished = [d for d in downloads if d.status in ("paused", "waiting")]
+    for d in failed:
+        print(f"✖ {d.name}: {d.message}", file=sys.stderr)
+        if d.error_status in EXPIRED_HTTP:
+            print(expired_link_hint(d), file=sys.stderr)
+    if unfinished and outcome == "deadline":
+        print(f"‖ Stopped at {show_clock(args.until)} as scheduled with {len(unfinished)} download(s) unfinished. "
+              "Run the same command again to continue.", file=sys.stderr)
+    elif unfinished:
+        print(f"‖ Paused {len(unfinished)} download(s). Run the same command again, "
+              "or 'mox resume' in that folder, to continue.", file=sys.stderr)
+    if outcome == "interrupted":
+        return 130
+    if failed:
+        return 1
+    return 3 if unfinished else 0
 
+
+def run_downloads(downloads: list[Download], args) -> int:
+    """Run downloads, on the --at/--until schedule if there is one, and report how it went."""
+    limiter = RateLimiter(args.limit)
     while True:
         now = datetime.datetime.now()
         if args.at and not (args.until and in_window(now, args.at, args.until)):
@@ -1112,22 +1354,238 @@ def main(argv=None) -> int:
         print(f"‖ Stopped at {show_clock(args.until)} as scheduled. Carrying on at {show_clock(args.at)}.",
               file=sys.stderr, flush=True)
         downloads = [d.restart() if d.status in ("paused", "waiting") else d for d in downloads]
+    if args.notify and outcome != "interrupted":
+        notify_summary(downloads, outcome)
+    return report(downloads, outcome, args)
 
-    failed = [d for d in downloads if d.status == "error"]
-    for d in failed:
-        print(f"✖ {d.name}: {d.message}", file=sys.stderr)
-        if d.error_status in EXPIRED_HTTP:
-            print(expired_link_hint(d), file=sys.stderr)
-    if unfinished and outcome == "deadline":
-        print(f"‖ Stopped at {show_clock(args.until)} as scheduled with {len(unfinished)} download(s) unfinished. "
-              "Run the same command again to continue.", file=sys.stderr)
-    elif unfinished:
-        print(f"‖ Paused {len(unfinished)} download(s). Run the same command again to resume.", file=sys.stderr)
-    if outcome == "interrupted":
-        return 130
-    if failed:
+
+# ---------------------------------------------------------------- mox resume
+
+def resume_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mox resume", description="Continue every unfinished download in a folder.",
+        epilog="mox remembers each unfinished download in a FILE.mox next to it, link included.")
+    parser.add_argument("dir", nargs="?", default=".", help="folder to look in (default: current)")
+    add_download_options(parser)
+    args = parser.parse_args(argv)
+    check_download_options(parser, args)
+    configure_proxy(args.proxy)
+
+    downloads = []
+    for entry in sorted(os.listdir(args.dir)) if os.path.isdir(args.dir) else []:
+        if not entry.endswith(STATE_SUFFIX):
+            continue
+        try:
+            with open(os.path.join(args.dir, entry), encoding="utf-8") as f:
+                url = json.load(f)["url"]
+        except (OSError, ValueError, KeyError, TypeError):
+            print(f"! skipping {entry}: not a state file mox can read", file=sys.stderr)
+            continue
+        downloads.append(Download(url, args, name=entry[:-len(STATE_SUFFIX)]))
+    if not downloads:
+        print(f"No unfinished downloads in {args.dir}.", file=sys.stderr)
+        return 0
+    return run_downloads(downloads, args)
+
+
+# ---------------------------------------------------------------- mox bench
+
+def bench_round(url: str, total: int | None, connections: int, seconds: float, args) -> tuple[float, bool, list[str]]:
+    """Download for `seconds` over `connections` connections, keeping nothing.
+
+    Returns (bytes per second, whether the round was too short to trust, why each refused
+    connection was refused).
+    """
+    received = [0]
+    first_finish: list[tuple[float, int]] = []  # (time, bytes) when the first connection ran out of work
+    refused: list[str] = []
+    lock = threading.Lock()
+    deadline = time.monotonic() + seconds
+
+    def fetch(start: int | None, end: int | None) -> None:
+        link = KeepAlive(url, args.timeout) if start is not None and keep_alive_possible(url) else None
+        try:
+            if link:
+                resp = link.get(build_headers(args.headers, start, end))
+                if resp.status not in (200, 206):
+                    raise ServerBusy(resp.status)
+            else:
+                resp = request(url, args.headers, args.timeout, start, end)
+            with resp:
+                while time.monotonic() < deadline:
+                    data = resp.read1(CHUNK)
+                    if not data:
+                        # Only a connection that got through its whole share ends the window.
+                        # A refused one (Hetzner answers 429 past two connections) must not:
+                        # it would stop the clock at zero bytes.
+                        with lock:
+                            if not first_finish:
+                                first_finish.append((time.monotonic(), received[0]))
+                        break
+                    with lock:
+                        received[0] += len(data)
+        except (RETRYABLE_ERRORS + (FatalError,)) as e:
+            with lock:
+                refused.append(reason(e))
+        finally:
+            if link:
+                link.close()
+
+    if total:
+        bounds = [(total * i // connections, total * (i + 1) // connections - 1) for i in range(connections)]
+    else:
+        bounds = [(None, None)]
+    threads = [threading.Thread(target=fetch, args=b, daemon=True) for b in bounds]
+    started = time.monotonic()
+    for t in threads:
+        t.start()
+    tty = sys.stderr.isatty()
+    label = f"{connections:>3} connection{'s' if connections > 1 else ' '}"
+    while any(t.is_alive() for t in threads):
+        time.sleep(FRAME_INTERVAL)
+        if tty:
+            elapsed = time.monotonic() - started
+            sys.stderr.write(f"\r\x1b[2K{label}  {human_size(received[0] / elapsed) + '/s':>11}  "
+                             f"\x1b[2m{max(0.0, seconds - elapsed):.0f}s left\x1b[0m")
+            sys.stderr.flush()
+    if tty:
+        sys.stderr.write("\r\x1b[2K")
+    # Count only while every connection was busy. Once the fast ones finish their share, the
+    # slow stragglers alone would drag the average down and hide what N connections can do.
+    ended, got = first_finish[0] if first_finish else (time.monotonic(), received[0])
+    window = max(ended - started, 1e-3)
+    return got / window, window < min(1.0, seconds / 2), refused
+
+
+def bench_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mox bench", description="Measure how much faster many connections are than one. "
+                                      "Nothing is saved to disk.")
+    parser.add_argument("url", metavar="URL")
+    parser.add_argument("-s", "--seconds", type=float, default=5, help="length of each round (default: 5)")
+    parser.add_argument("-c", "--connections", type=int, default=DEFAULT_CONNECTIONS,
+                        help=f"most connections to try (default: {DEFAULT_CONNECTIONS})")
+    add_network_options(parser)
+    args = parser.parse_args(argv)
+    if not 1 <= args.connections <= MAX_CONNECTIONS:
+        parser.error(f"--connections must be between 1 and {MAX_CONNECTIONS}")
+    check_network_options(parser, args)
+    configure_proxy(args.proxy)
+    url = args.url if "://" in args.url else "https://" + args.url
+
+    try:
+        final, total, ranges, name, _ = probe(url, args.headers, args.timeout)
+    except (RETRYABLE_ERRORS + (FatalError,)) as e:
+        print(f"✖ {reason(e)}", file=sys.stderr)
         return 1
-    return 3 if unfinished else 0
+    support = "supports range requests" if ranges else "does not support range requests"
+    print(f"{name} · {human_size(total)} · the server {support}")
+    levels = sorted({1, min(4, args.connections), args.connections}) if ranges else [1]
+    rates: dict[int, float] = {}
+    allowed: int | None = None  # how many connections the server accepted, when it refused some
+    rough = False
+    try:
+        for connections in levels:
+            rate, short, refused = bench_round(final, total if ranges else None, connections, args.seconds, args)
+            rates[connections] = rate
+            rough = rough or short
+            gain = f"  {rate / rates[1]:4.1f}×" if connections > 1 and rates[1] else ""
+            label = f"{connections:>3} connection{'s' if connections > 1 else ' '}"
+            note = f"  \x1b[2m{len(refused)} refused: {refused[0]}\x1b[0m" if refused and sys.stdout.isatty() \
+                else (f"  {len(refused)} refused: {refused[0]}" if refused else "")
+            print(f"{label}  {human_size(rate) + '/s':>11}{gain}{note}", flush=True)
+            if refused and allowed is None:
+                allowed = connections - len(refused)
+    except KeyboardInterrupt:
+        return 130
+
+    best = max(rates, key=rates.get)
+    gain = rates[best] / rates[1] if rates[1] else 0
+    if not ranges:
+        print("This server sends files in one piece, so extra connections cannot help here.")
+    elif allowed is not None:
+        print(f"This server accepts only about {max(allowed, 1)} connections at once and refuses the rest. "
+              f"mox backs off by itself, but -c {max(allowed, 1)} avoids the refusals.")
+    elif gain >= 1.5:
+        print(f"This server limits each connection. With -c {best}, mox is about {gain:.0f}× faster here "
+              "than a one-connection download such as wget or curl.")
+    else:
+        print("Extra connections barely help here: your line or the server's total is the limit. "
+              "A few connections, -c 4, are plenty.")
+    if rough:
+        print("The file is small enough to finish within a round, so these numbers are rough.")
+    return 0
+
+
+# ---------------------------------------------------------------- library
+
+class DownloadError(Exception):
+    """Raised by download() when a file could not be downloaded."""
+
+
+def download(url: str, directory: str = ".", *, name: str | None = None,
+             connections: int = DEFAULT_CONNECTIONS, limit: int | str | None = None, retries: int = 10,
+             timeout: float = 30, headers: dict | None = None, sha256: str | None = None,
+             proxy: str | None = None, progress=None) -> str:
+    """Download one URL over many connections and return the path of the saved file.
+
+    It resumes a matching unfinished download in `directory`, just like the command does.
+    `limit` is bytes per second, or text such as "2M". `progress`, if given, is called about
+    four times a second with (bytes done, total bytes or None). `proxy` applies to the whole
+    process, since all requests share one opener. Raises DownloadError on failure.
+    """
+    if not 1 <= connections <= MAX_CONNECTIONS:
+        raise ValueError(f"connections must be between 1 and {MAX_CONNECTIONS}")
+    if isinstance(limit, str):
+        try:
+            limit = parse_rate(limit)
+        except argparse.ArgumentTypeError as e:
+            raise ValueError(str(e)) from None
+    configure_proxy(proxy)
+    opts = argparse.Namespace(dir=directory, connections=connections, retries=retries,
+                              timeout=timeout, headers=dict(headers or {}), limit=limit)
+    d = Download(url if "://" in url else "https://" + url, opts, name=name, sha256=sha256)
+    stop = threading.Event()
+    worker = threading.Thread(target=d.run, args=(stop, RateLimiter(limit)), daemon=True)
+    worker.start()
+    try:
+        while worker.is_alive():
+            worker.join(FRAME_INTERVAL)
+            if progress:
+                progress(d.done, d.total)
+    except BaseException:
+        stop.set()
+        worker.join()
+        raise
+    finally:
+        if d.path:
+            with _claim_lock:
+                _claimed_paths.discard(os.path.abspath(d.path))
+    if d.status != "done":
+        raise DownloadError(f"{d.name}: {d.message or d.status}")
+    return d.path
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] == "resume":
+        return resume_main(argv[1:])
+    if argv and argv[0] == "bench":
+        return bench_main(argv[1:])
+    args = parse_args(argv)
+    configure_proxy(args.proxy)
+    downloads = [Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
+    if not args.watch:
+        return run_downloads(downloads, args)
+    command = clipboard_command()
+    if not command:
+        print("✖ --watch needs a clipboard tool: wl-clipboard on Wayland, xclip or xsel on X11, "
+              "termux-api on Termux. Or set MOX_CLIPBOARD_COMMAND.", file=sys.stderr)
+        return 2
+    outcome = watch_session(downloads, args, RateLimiter(args.limit), command)
+    return report(downloads, outcome, args)
 
 
 if __name__ == "__main__":
