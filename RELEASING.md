@@ -26,6 +26,8 @@ The workflow publishes with PyPI's trusted publishing, so no API token lives in 
    - Repository name: `moxdl`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
+
+   Enter the repository and workflow as bare names, not `moxart/moxdl` or `.github/workflows/release.yml`. If any field is off, the `pypi` job fails with `invalid-publisher` and prints the claims GitHub sent; fix the publisher to match them, then use *Re-run failed jobs* on that run instead of tagging again.
 3. On GitHub, open the repository's *Settings → Environments* and create an environment named `pypi`.
 
 The first tag pushed after that creates the project on PyPI. From then on `pipx install moxdl` works, and the README can say so.
