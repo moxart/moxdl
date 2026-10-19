@@ -1354,6 +1354,14 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
 
 def expired_link_hint(d: Download) -> str:
     folder = os.path.dirname(d.path) if d.path else d.opts.dir
+    started = os.path.exists(os.path.join(folder or ".", d.name + STATE_SUFFIX))
+    query = urllib.parse.urlsplit(d.url).query
+    # An unquoted link like 'file.mkv?md5=...&expires=...' reaches mox as 'file.mkv?md5=...': the
+    # shell takes '&' to mean "run in the background". The server then refuses the link, and
+    # telling the user it expired sent them looking for a fresh link they did not need.
+    if query and "&" not in query and not started:
+        return ("  If the link has an '&' in it, the shell cut it off there. Run the command again\n"
+                "  with the whole link inside single quotes:  mox 'https://...the whole link...'")
     return ("  If this link worked before, it has probably expired. Get a fresh link and run\n"
             f"  mox -d {shlex.quote(folder or '.')} -o {shlex.quote(d.name)} 'NEW_LINK'\n"
             "  to continue from where it stopped.")

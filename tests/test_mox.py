@@ -445,6 +445,21 @@ class MoxTest(unittest.TestCase):
         self.assertIn("resumed", fresh.stderr)
         self.assertDownloaded()
 
+    def test_link_cut_by_the_shell(self):
+        # What 'mox URL?md5=x&expires=y' without quotes sends: everything before the '&'.
+        result = self.mox(f"{self.base}/gone/big.bin?md5=x")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("inside single quotes", result.stderr)
+        self.assertNotIn("expired", result.stderr)
+
+    def test_expired_link_with_query_while_resuming(self):
+        result = self.mox(f"{self.base}/big.bin?token=a", "-l", "2M", "--until", clock_in(2))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        expired = self.mox(f"{self.base}/gone/big.bin?token=a")
+        self.assertEqual(expired.returncode, 1)
+        self.assertIn("expired", expired.stderr)
+        self.assertNotIn("single quotes", expired.stderr)
+
     def test_file_changed_while_paused(self):
         served = os.path.join(self.root, "paused-change.bin")
         replace_with_random(served)
