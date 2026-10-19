@@ -1,6 +1,6 @@
 # Maintainer: Patrick Der Avakians <patrickderavakians at gmail dot com>
 pkgname=moxdl
-pkgver=1.3
+pkgver=1.4
 pkgrel=1
 pkgdesc="Fast, resumable, multi-connection download manager for the terminal"
 arch=('any')

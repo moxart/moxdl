@@ -29,7 +29,7 @@ import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-VERSION = "1.3"
+VERSION = "1.4"
 CHUNK = 256 * 1024
 MIN_SPLIT = 256 * 1024  # smallest piece when first dividing a file between connections
 MIN_STEAL = 64 * 1024   # smallest piece an idle connection takes over from a busy one
