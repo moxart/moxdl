@@ -44,8 +44,9 @@ HOLD = 3.0        # seconds the last frame stays up before the loop restarts
 CELL_W, CELL_H, PAD, BAR = 8.4, 19, 16, 28
 PALETTE = {"fg": "#d7dae0", "bg": "#1e2127", "30": "#5c6370", "31": "#e06c75", "32": "#98c379",
            "33": "#e5c07b", "34": "#61afef", "35": "#c678dd", "36": "#56b6c2", "37": "#d7dae0",
-           "97": "#ffffff", "dim": "#7f848e", "prompt": "#98c379"}
+           "96": "#8be9f5", "97": "#ffffff", "dim": "#7f848e", "prompt": "#98c379"}
 BLOCKS = {"█": 1.0, "▓": 0.72, "▒": 0.45, "░": 0.13}
+LINE = "━"  # mox's progress bar, drawn as a thin rule so it looks like it does in a terminal
 
 
 # ---------------------------------------------------------------- the throttled server
@@ -128,7 +129,7 @@ def record(workdir: str, port: int) -> list[tuple[float, bytes]]:
 # ---------------------------------------------------------------- a tiny terminal
 
 class Screen:
-    """Just enough of a VT100 for what mox prints: text, CR/LF, erase line, cursor up, colors."""
+    """Just enough of a VT100 for what mox prints: text, CR/LF, erase line and below, cursor up, colors."""
 
     def __init__(self, rows: int, cols: int):
         self.rows, self.cols = rows, cols
@@ -164,6 +165,9 @@ class Screen:
             self.style = "" if codes == ["0"] else ";".join(codes)
         elif command == "K":
             self.grid[self.row] = [(" ", "")] * self.cols
+        elif command == "J":
+            for r in range(self.row, self.rows):
+                self.grid[r] = [(" ", "")] * self.cols
         elif command == "F":
             self.row, self.col = max(0, self.row - count), 0
         elif command == "A":
@@ -216,7 +220,14 @@ def render_frame(grid) -> str:
                 c += 1
                 continue
             run_end = c
-            if char in BLOCKS:
+            if char == LINE:
+                while run_end < len(line) and line[run_end] == (char, style):
+                    run_end += 1
+                color, _, dim = color_of(style)
+                out.append(f'<rect x="{PAD + c * CELL_W:.1f}" y="{y + CELL_H / 2 - 1:.1f}" '
+                           f'width="{(run_end - c) * CELL_W:.1f}" height="4" fill="{color}" '
+                           f'fill-opacity="{0.35 if dim else 1}"/>')
+            elif char in BLOCKS:
                 while run_end < len(line) and line[run_end] == (char, style):
                     run_end += 1
                 color, _, dim = color_of(style)
@@ -224,7 +235,7 @@ def render_frame(grid) -> str:
                 out.append(f'<rect x="{PAD + c * CELL_W:.1f}" y="{y + 3}" width="{(run_end - c) * CELL_W:.1f}" '
                            f'height="{CELL_H - 6}" fill="{color}" fill-opacity="{opacity:.2f}"/>')
             else:
-                while (run_end < len(line) and line[run_end][1] == style and line[run_end][0] not in BLOCKS
+                while (run_end < len(line) and line[run_end][1] == style and line[run_end][0] not in BLOCKS and line[run_end][0] != LINE
                        and not (line[run_end][0] == " " and run_end + 1 < len(line)
                                 and line[run_end + 1][0] == " ")):
                     run_end += 1
@@ -242,8 +253,17 @@ def svg(frames) -> str:
     height = PAD * 2 + BAR + ROWS * CELL_H
     total = len(frames) * FRAME
     share = 100 / len(frames)
-    groups = "\n".join(f'<g class="f" style="animation-delay:{i * FRAME:.2f}s">{render_frame(f)}</g>'
-                       for i, f in enumerate(frames))
+    # Image viewers built on librsvg ignore CSS animations, so every frame stays hidden there. The
+    # busiest frame (the most files downloading, then the most of their bars filled) sits underneath
+    # as a still, and each animated frame paints over it while shown.
+    cover = f'<rect y="{PAD + BAR}" width="100%" height="{ROWS * CELL_H}" fill="{PALETTE["bg"]}"/>'
+    busiest = max(frames, key=lambda grid: (sum(line[0][0] == "↓" for line in grid),
+                                            sum(char == LINE and "2" not in style.split(";")
+                                                for line in grid for char, style in line)))
+    still = f"<g>{render_frame(busiest)}</g>"
+    groups = still + "\n" + "\n".join(
+        f'<g class="f" style="animation-delay:{i * FRAME:.2f}s">{cover}{render_frame(f)}</g>'
+        for i, f in enumerate(frames))
     return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{width:.0f}" height="{height:.0f}" viewBox="0 0 {width:.0f} {height:.0f}">
 <title>mox downloading three files over 16 connections each</title>
 <style>

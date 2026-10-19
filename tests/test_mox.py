@@ -38,6 +38,7 @@ import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 MOX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mox.py")
 SIZE = 8 * 1024 * 1024
@@ -476,10 +477,9 @@ class MoxTest(unittest.TestCase):
 
     def test_coverage_map(self):
         mox = load_mox()
-        # 100 bytes in 10 cells: first piece complete, second half done and writing at byte 75.
-        cells = mox.coverage_map([(0, 50, False), (50, 25, True)], 100, 10)
-        self.assertEqual([shade for shade, _ in cells], [3, 3, 3, 3, 3, 3, 3, 2, 0, 0])
-        self.assertEqual([i for i, (_, head) in enumerate(cells) if head], [7])
+        # 100 bytes in 10 cells: first piece complete, second one half done.
+        self.assertEqual(mox.coverage_map([(0, 50), (50, 25)], 100, 10), [3, 3, 3, 3, 3, 3, 3, 2, 0, 0])
+        self.assertEqual(mox.coverage_map([(0, 3)], 100, 10), [1, 0, 0, 0, 0, 0, 0, 0, 0, 0])
         self.assertEqual(mox.coverage_map([], 0, 10), [])
 
     def test_display_draws_piece_map(self):
@@ -494,11 +494,40 @@ class MoxTest(unittest.TestCase):
         d.segments = [{"start": 0, "end": 499, "done": 300, "busy": True},
                       {"start": 500, "end": 999, "done": 0, "busy": True}]
         screen = Terminal()
-        mox.Display([d], stream=screen).draw()
-        lines = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", screen.getvalue()).splitlines()
+        with mock.patch("shutil.get_terminal_size", return_value=os.terminal_size((100, 24))):
+            mox.Display([d], stream=screen).draw()
+        output = screen.getvalue()
+        lines = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", output).splitlines()
+        self.assertEqual(len(lines), 2)  # one row per download, then the summary
         self.assertIn("big.bin", lines[0])
-        self.assertTrue(lines[1].strip().startswith("█"))
-        self.assertTrue(lines[1].strip().endswith("░"))
+        self.assertIn("30.0%", lines[0])
+        # The bar is the piece map: the first piece is 60% done, the second not started.
+        self.assertRegex(output, "\x1b\\[96m━+\x1b\\[0m(\x1b\\[(2;)?36m━\x1b\\[0m)?\x1b\\[2;37m━+")
+
+    def test_display_redraw_after_resize(self):
+        mox = load_mox()
+
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.status, d.total, d.done, d.name = "downloading", 1000, 300, "a-rather-long-file-name.bin"
+        screen = Terminal()
+        display = mox.Display([d], stream=screen)
+        with mock.patch("shutil.get_terminal_size", return_value=os.terminal_size((120, 24))):
+            display.draw()
+        wide = list(display.drawn)
+        with mock.patch("shutil.get_terminal_size", return_value=os.terminal_size((50, 24))):
+            screen.truncate(0)
+            screen.seek(0)
+            display.draw()
+        # The terminal rewrapped the 120-column frame to 50 columns, so moving to its top takes
+        # more rows than it had lines.
+        up = sum(-(-w // 50) for w in wide)
+        self.assertGreater(up, len(wide))
+        self.assertIn(f"\x1b[{up}F", screen.getvalue())
+        self.assertTrue(all(w < 50 for w in display.drawn))
 
     # -- mox bench
 

@@ -455,10 +455,10 @@ class Download:
         except Exception as e:  # keep one broken download from killing the rest
             self.status, self.message = "error", f"{type(e).__name__}: {e}"
 
-    def pieces(self) -> list[tuple[int, int, bool]]:
-        """(start, bytes done, busy) for every piece, for drawing the map."""
+    def pieces(self) -> list[tuple[int, int]]:
+        """(start, bytes done) for every piece, for drawing the map."""
         with self.lock:
-            return [(s["start"], s["done"], bool(s.get("busy"))) for s in self.segments]
+            return [(s["start"], s["done"]) for s in self.segments]
 
     def speed(self) -> float:
         now = time.monotonic()
@@ -875,28 +875,35 @@ STYLE = {  # status: (icon, ANSI color)
 }
 
 
-MAP_SHADES = "░▒▓█"  # nothing, some, most, all of a cell's bytes downloaded
+BAR = "━"           # every cell of the progress bar; its color says how much of that cell is done
+# By shade: nothing, some, most, all of the cell's bytes on disk. Marking the cells connections
+# were writing to made the bar solid white once there were more connections than cells.
+BAR_COLORS = ("2;37", "2;36", "36", "96")
+BAR_MIN, BAR_GOOD, BAR_MAX = 10, 20, 40  # past BAR_MAX a bar only spreads the same information thinner
+NAME_MIN = 16       # narrower than this and rows drop columns to keep the name readable
+NAME_WANT = 40      # names get this much before the bar grows past BAR_MIN
+FIELDS = [(6, ""), (10, ""), (7, ""), (19, "2"), (3, "2")]  # width and style: %, speed, ETA, size, connections
 
 
-def coverage_map(pieces: list[tuple[int, int, bool]], total: int, width: int) -> list[tuple[int, bool]]:
-    """Split the file into `width` cells. For each: a shade index into MAP_SHADES, and whether a
-    connection is writing inside it right now."""
+def fields_width(count: int) -> int:
+    return sum(w + 2 for w, _ in FIELDS[:count])
+
+
+def coverage_map(pieces: list[tuple[int, int]], total: int, width: int) -> list[int]:
+    """Split the file into `width` cells and shade each by how much of it is on disk: 0 for
+    nothing, 1 for some, 2 for most, 3 for all."""
     if not total or width <= 0:
         return []
     cell = total / width
     filled = [0.0] * width
-    heads = [False] * width
-    for start, done, busy in pieces:
+    for start, done in pieces:
         end = start + done  # bytes [start, end) are on disk
         if done > 0:
             for i in range(int(start // cell), min(width - 1, int((end - 1) // cell)) + 1):
                 overlap = min(end, (i + 1) * cell) - max(start, i * cell)
                 if overlap > 0:
                     filled[i] += overlap / cell
-        if busy and end < total:
-            heads[min(width - 1, int(end // cell))] = True
-    shades = [3 if f >= 0.999 else 2 if f >= 0.5 else 1 if f > 0 else 0 for f in filled]
-    return list(zip(shades, heads))
+    return [3 if f >= 0.999 else 2 if f >= 0.5 else 1 if f > 0 else 0 for f in filled]
 
 
 class Display:
@@ -905,7 +912,7 @@ class Display:
         self.stream = stream
         self.tty = stream.isatty()
         self.watching = watching
-        self.drawn = 0
+        self.drawn: list[int] = []  # screen width of each row of the last frame
         self.reported: dict[int, str] = {}
 
     def draw(self) -> None:
@@ -913,25 +920,22 @@ class Display:
             self._log_changes()
             return
         size = shutil.get_terminal_size((100, 24))
+        # One column spare: a row that fills the last column leaves some terminals waiting to wrap.
         width = size.columns - 1
         visible = self._visible(max(1, size.lines - 2))
-        mapped = [d for d in visible if d.status == "downloading" and d.total]
-        # Each active download gets a second line with its piece map, when the screen has room.
-        with_maps = len(visible) + len(mapped) + 1 <= size.lines - 1
-        rows = []
-        for d in visible:
-            rows.append(self._row(d, width))
-            if with_maps and d in mapped:
-                rows.append(self._map_row(d, width))
+        layout = self._layout(visible, width)
+        rows = [self._row(d, layout, width) for d in visible]
         rows.append(self._summary(width))
+        # After a resize the terminal rewraps the old frame, so a row drawn at 120 columns now
+        # takes two rows at 80. Moving up one row per old row left stale copies of the frame
+        # behind every time the window got narrower.
+        up = sum(max(1, -(-w // size.columns)) for w in self.drawn)
         out = ["\x1b[?25l"]
-        if self.drawn:
-            out.append(f"\x1b[{self.drawn}F")
+        if up:
+            out.append(f"\x1b[{up}F")
         out.extend(f"\x1b[2K{row}\n" for row in rows)
-        leftover = self.drawn - len(rows)
-        if leftover > 0:
-            out.append("\x1b[2K\n" * leftover + f"\x1b[{leftover}F")
-        self.drawn = len(rows)
+        out.append("\x1b[J")
+        self.drawn = [screen_width(row) for row in rows]
         self.stream.write("".join(out))
         self.stream.flush()
 
@@ -947,51 +951,68 @@ class Display:
         chosen = sorted(range(len(self.downloads)), key=lambda i: (rank[self.downloads[i].status], i))[:limit]
         return [self.downloads[i] for i in sorted(chosen)]
 
-    def _row(self, d: Download, width: int) -> str:
-        icon, color = STYLE[d.status]
-        bar_width = 20 if width >= 100 else 10
-        if d.total:
-            fraction = min(1.0, d.done / d.total)
-            filled = int(bar_width * fraction)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            percent = f"{fraction * 100:5.1f}%"
-        elif d.status == "downloading":
-            head = int(time.monotonic() * 8) % bar_width
-            bar = "".join("█" if (i - head) % bar_width < 3 else "░" for i in range(bar_width))
-            percent = "      "
-        else:
-            bar, percent = "░" * bar_width, "      "
-        if d.status == "done" and d.total == 0:
-            bar, percent = "█" * bar_width, "100.0%"
-        size = "" if d.status == "waiting" else f"{human_size(d.done)}/{human_size(d.total)}"
+    @staticmethod
+    def _layout(visible: list[Download], width: int) -> tuple[int, int, int]:
+        """Column widths shared by every row, so bars and numbers line up: (name, bar, fields
+        kept). Fields are dropped from the right, least useful first, until the name has room."""
+        longest = max([screen_width(d.name) for d in visible] + [NAME_MIN])
+        count = len(FIELDS)
+        # Size and connection count matter less than a bar long enough to read as a map.
+        while count > 3 and width - 2 - (BAR_GOOD + 2) - fields_width(count) < min(longest, NAME_WANT):
+            count -= 1
+        while count > 2 and width - 2 - (BAR_MIN + 2) - fields_width(count) < NAME_MIN:
+            count -= 1
+        room = width - 2 - fields_width(count)
+        bar = min(BAR_MAX, room - min(longest, NAME_WANT) - 2)
+        if bar < BAR_MIN:
+            bar = BAR_MIN if room - NAME_MIN - 2 >= BAR_MIN else 0
+        name = max(1, min(longest, room - (bar + 2 if bar else 0)))
+        return name, bar, count
 
-        if d.status == "downloading":
+    def _row(self, d: Download, layout: tuple[int, int, int], width: int) -> str:
+        """One line per download: name, a bar that doubles as the piece map, then the numbers."""
+        name_width, bar_width, count = layout
+        icon, color = STYLE[d.status]
+        parts = [(f"{icon} ", color), (clip(d.name, name_width), "2" if d.status == "done" else "")]
+        if bar_width:
+            parts.append(("  ", ""))
+            parts.extend(self._bar(d, bar_width) if d.status != "done" else [(" " * bar_width, "")])
+        if d.status == "downloading" and not d.message.startswith("retry"):
             speed = d.speed()
             left = (d.total - d.done) / speed if d.total and speed > 0 else None
-            tail = f"{human_size(speed) + '/s':>11} {human_time(left):>8} {d.active:>2}×"
-            if d.message.startswith("retry"):
-                tail = d.message
+            values = [percent(d), f"{human_size(speed)}/s", human_time(left),
+                      f"{human_size(d.done)}/{human_size(d.total)}", f"{d.active}×"]
+            parts.extend(("  " + value.rjust(w), style) for value, (w, style) in zip(values, FIELDS[:count]))
         else:
-            tail = d.message or d.status
-
-        right = f" {percent} {size:>19}  "
-        tail_width = 24
-        name_width = max(8, width - 2 - bar_width - len(right) - tail_width - 1)
-        line = [(f"{icon} ", color), (clip(d.name, name_width) + " ", ""), (bar, color),
-                (right, ""), (clip(tail, tail_width), "2" if d.status != "downloading" else "")]
-        return fit(line, width)
+            if d.status == "done":
+                note, style = f"{d.message or 'done'} · {human_size(d.total or d.done)}", "2"
+            elif d.status == "downloading":  # retrying
+                note, style = d.message, "33"
+            else:
+                note, style = d.message or d.status, "2"
+            parts.append(("  " + ("" if d.status == "done" else percent(d)).rjust(FIELDS[0][0]), ""))
+            parts.append(("  " + note, style))
+        return fit(parts, width)
 
     @staticmethod
-    def _map_row(d: Download, width: int) -> str:
-        parts: list[tuple[str, str]] = [("  ", "")]
-        for shade, head in coverage_map(d.pieces(), d.total, width - 3):
-            color = "1;97" if head else ("36" if shade else "2")
-            char = MAP_SHADES[shade]
-            if parts[-1][1] == color:
-                parts[-1] = (parts[-1][0] + char, color)
+    def _bar(d: Download, width: int) -> list[tuple[str, str]]:
+        if d.total:
+            cells = coverage_map(d.pieces(), d.total, width)
+        elif d.status == "downloading":  # unknown size: a pulse that shows it is alive
+            head = int(time.monotonic() * 8) % width
+            cells = [3 if (i - head) % width < 3 else 0 for i in range(width)]
+        else:
+            cells = [0] * width
+        parts: list[tuple[str, str]] = []
+        for shade in cells:
+            style = BAR_COLORS[shade]
+            if d.status not in ("downloading", "verifying") and shade:
+                style = "2;33" if d.status == "paused" else "2;37"
+            if parts and parts[-1][1] == style:
+                parts[-1] = (parts[-1][0] + BAR, style)
             else:
-                parts.append((char, color))
-        return fit(parts, width)
+                parts.append((BAR, style))
+        return parts
 
     def _summary(self, width: int) -> str:
         counts: dict[str, int] = {}
@@ -1018,14 +1039,34 @@ class Display:
                 print(f"[{d.status}] {d.name}: {detail}", file=self.stream, flush=True)
 
 
+def percent(d: Download) -> str:
+    if d.total:
+        return f"{min(1.0, d.done / d.total) * 100:.1f}%"
+    return "100.0%" if d.status == "done" else ""
+
+
+def screen_width(text: str) -> int:
+    return sum(char_width(c) for c in re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text))
+
+
 def fit(parts: list[tuple[str, str]], width: int) -> str:
+    """Join colored pieces, cut at `width` screen columns. Cutting by characters let wide
+    characters in a file name push the row past the edge, where it wrapped and broke the redraw."""
     out, left = [], width
     for text, color in parts:
+        kept = []
+        for c in text:
+            w = char_width(c)
+            if w > left:
+                left = 0
+                break
+            kept.append(c)
+            left -= w
+        if kept:
+            text = "".join(kept)
+            out.append(f"\x1b[{color}m{text}\x1b[0m" if color else text)
         if left <= 0:
             break
-        text = text[:left]
-        left -= sum(char_width(c) for c in text)
-        out.append(f"\x1b[{color}m{text}\x1b[0m" if color else text)
     return "".join(out)
 
 

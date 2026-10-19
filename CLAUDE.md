@@ -42,7 +42,7 @@ There is no build step or linter config. GitHub Actions runs the tests on Python
 
 **Commands besides plain downloads:** `main` dispatches `mox resume [DIR]` (`resume_main`, rebuilds `Download`s from the `url` in each `.mox` file) and `mox bench URL` (`bench_main`/`bench_round`, keeps nothing; a round's rate counts only until the first connection *finishes its share*, so refused connections cannot stop the clock). `--watch` runs `watch_session`, which polls the clipboard via `clipboard_command` and adds `Download`s to the live list. `--notify` calls `notify`, which uses desktop tools plus Telegram when `MOX_TELEGRAM_TOKEN`/`MOX_TELEGRAM_CHAT` are set. `download()` is the library entry point and raises `DownloadError`.
 
-**Display:** with room on screen, each active download gets a second line drawn from `coverage_map`, the piece map.
+**Display:** one row per download. Column widths are computed once per frame (`Display._layout`) so rows line up, and columns drop out as the terminal narrows. The progress bar is the piece map, drawn from `coverage_map`. Each redraw moves up by the rows the previous frame takes *after* the terminal rewraps it, so resizing leaves no stale copies.
 
 **Tuning constants** sit at the top of `mox.py` with comments explaining each one. Change them there, not inline.
 
