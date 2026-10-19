@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moxdl"
+version = "1.2"
+description = "Fast, resumable, multi-connection downloads in the terminal"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Patrick Der Avakians" }]
+requires-python = ">=3.8"
+keywords = ["download", "downloader", "download-manager", "cli", "http"]
+classifiers = [
+    "Environment :: Console",
+    "Programming Language :: Python :: 3",
+    "Topic :: Internet :: WWW/HTTP",
+]
+
+[project.urls]
+Homepage = "https://github.com/moxart/moxdl"
+Issues = "https://github.com/moxart/moxdl/issues"
+
+[project.scripts]
+mox = "mox:main"
+
+[tool.setuptools]
+py-modules = ["mox"]
