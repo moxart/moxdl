@@ -147,7 +147,7 @@ Leave the terminal open and the computer awake. With only `--until`, mox stops a
 
 Add `--then shutdown` or `--then sleep` to turn the computer off when everything is done. mox counts down a minute first, so Ctrl+C can still cancel it.
 
-If the internet goes down, mox waits for it as long as it takes, without using up its retries, and continues by itself. It tells an outage from a dead server by also trying `1.1.1.1` and `8.8.8.8`. Where those are blocked, set `MOX_ONLINE_CHECK` to other addresses, such as `MOX_ONLINE_CHECK=192.0.2.1:443,198.51.100.7:80`.
+If the internet goes down, mox waits for it as long as it takes, without using up its retries, and continues by itself. It tells an outage from a dead server by also trying `1.1.1.1` and `8.8.8.8`. Where those are blocked, set `MOX_ONLINE_CHECK` to other servers that are normally reachable, such as `MOX_ONLINE_CHECK=host1.example:443,host2.example:443`. Through a SOCKS5 proxy the check goes through the proxy; through an HTTP proxy only the proxy itself can be checked, so prefer SOCKS5 if your proxy offers both.
 
 ### Data plans
 
