@@ -11,7 +11,9 @@ import datetime
 import functools
 import hashlib
 import http.client
+import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -19,6 +21,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -27,6 +30,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import wave
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -56,6 +60,7 @@ ONLINE_CHECK_TIMEOUT = 3.0
 # from just before an outage made its first errors count as retries.
 ONLINE_CHECK_SHARED = 1.0
 OFFLINE_MESSAGE = "no internet, waiting for it to come back"
+SOUND_PEAK = 0.07       # loudness of --sound, about -23 dBFS: noticeable, never startling
 THEN_DELAY = 60         # seconds of warning before --then shuts down or sleeps, time to press Ctrl+C
 RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 BUSY_HTTP = {429, 503}  # the server wants fewer connections
@@ -1052,6 +1057,11 @@ STYLE = {  # status: (icon, ANSI color)
     "error": ("✖", "31"),
     "paused": ("‖", "33"),
 }
+# In place of the icon while a download is busy but no data flows: connecting, retrying, waiting
+# for the internet, checking the SHA-256. One dot splits into six and back, the way one
+# connection becomes many. In the copper of the progress bar, one frame per redraw.
+SPINNER = "⠂⠅⠕⠝⠟⠿⠟⠝⠕⠅"
+SPINNER_COLOR = "38;5;173"
 
 
 BAR = "━"           # every cell of the progress bar; its color says how much of that cell is done
@@ -1154,6 +1164,9 @@ class Display:
         """One line per download: name, a bar that doubles as the piece map, then the numbers."""
         name_width, bar_width, count = layout
         icon, color = STYLE[d.status]
+        if d.status in ("connecting", "verifying") or \
+                (d.status == "downloading" and d.message.startswith(("retry", OFFLINE_MESSAGE))):
+            icon, color = SPINNER[int(time.monotonic() / FRAME_INTERVAL) % len(SPINNER)], SPINNER_COLOR
         parts = [(f"{icon} ", color), (clip(d.name, name_width), "2" if d.status == "done" else "")]
         if bar_width:
             parts.append(("  ", ""))
@@ -1282,6 +1295,10 @@ def add_download_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--then", choices=("shutdown", "sleep"),
                         help=f"when the downloads end, shut down or sleep the computer, after {THEN_DELAY} "
                              "seconds to cancel with Ctrl+C")
+    parser.add_argument("--sound", action="store_const", const=True, default=None,
+                        help="play a soft sound when downloads finish; MOX_SOUND=1 turns it on for good")
+    parser.add_argument("--no-sound", dest="sound", action="store_const", const=False,
+                        help="no sound this time, even with MOX_SOUND=1")
     parser.add_argument("--no-history", dest="history", action="store_false",
                         help="do not add these downloads to the history ('mox history'); "
                              "MOX_NO_HISTORY=1 turns it off for good")
@@ -1312,6 +1329,8 @@ def check_download_options(parser: argparse.ArgumentParser, args) -> None:
     check_network_options(parser, args)
     if history_disabled():
         args.history = False
+    if args.sound is None:
+        args.sound = os.environ.get("MOX_SOUND", "") not in ("", "0")
 
 
 def parse_args(argv):
@@ -1492,6 +1511,73 @@ def power_off(action: str) -> None:
               file=sys.stderr)
 
 
+# ---------------------------------------------------------------- --sound
+
+def done_sound() -> bytes:
+    """The --sound chime as a WAV file: one low, hollow note, like blowing across a bottle.
+
+    Made here rather than shipped, so mox stays one file and sounds the same everywhere. Every
+    choice keeps it gentle, after brighter versions were found grating: a low note (220 Hz) with
+    only a faint third harmonic, a 25 ms S-shaped rise with no click at the start, a low-pass at
+    1.2 kHz, and a quiet peak.
+    """
+    rate, length, freq, rise, decay = 44100, 0.45, 220.0, 0.025, 0.12
+    lowpass = 1 - math.exp(-2 * math.pi * 1200 / rate)
+    samples, low = [], 0.0
+    for i in range(int(length * rate)):
+        t = i / rate
+        attack = 0.5 - 0.5 * math.cos(math.pi * min(1.0, t / rise))
+        wave_value = math.sin(2 * math.pi * freq * t) + 0.03 * math.sin(6 * math.pi * freq * t) * math.exp(-6 * t)
+        low += lowpass * (attack * math.exp(-t / decay) * wave_value - low)
+        samples.append(low)
+    fade = int(0.02 * rate)  # the last 20 ms go to silence, so the end does not click either
+    for i in range(fade):
+        samples[-1 - i] *= i / fade
+    scale = SOUND_PEAK * 32767 / max(abs(v) for v in samples)
+    data = io.BytesIO()
+    with wave.open(data, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", int(v * scale)) for v in samples))
+    return data.getvalue()
+
+
+def sound_file() -> str:
+    """The chime saved in the cache folder, since the players below take a file, not bytes."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    path = os.path.join(base, "mox", "done.wav")
+    data = done_sound()
+    try:
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return path
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".new", "wb") as f:
+        f.write(data)
+    os.replace(path + ".new", path)
+    return path
+
+
+def play_done_sound() -> None:
+    """Play the chime without waiting for it. No player, or a failing one, means no sound, never an error."""
+    try:
+        if sys.platform == "win32":
+            import winsound  # Windows only, part of the standard library there
+            winsound.PlaySound(done_sound(), winsound.SND_MEMORY)
+            return
+        players = (["pw-play"], ["paplay"], ["aplay", "-q"], ["afplay"], ["termux-media-player", "play"])
+        player = next((p for p in players if shutil.which(p[0])), None)
+        if player:
+            # A session of its own, so the sound finishes even when mox exits first.
+            subprocess.Popen(player + [sound_file()], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    except (OSError, RuntimeError):
+        pass
+
+
 # ---------------------------------------------------------------- clipboard
 
 URL_PATTERN = re.compile(r"https?://[^\s<>\"'`]+")
@@ -1601,12 +1687,14 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
                             d = Download(url, args)
                             downloads.append(d)
                             futures.append(pool.submit(d.run, stop, limiter))
-                if args.notify:
-                    for d in downloads:
-                        if d.status in ("done", "error") and id(d) not in announced:
-                            announced.add(id(d))
+                for d in downloads:
+                    if d.status in ("done", "error") and id(d) not in announced:
+                        announced.add(id(d))
+                        if args.notify:
                             notify("mox: download finished" if d.status == "done" else "mox: download failed",
                                    d.name if d.status == "done" else f"{d.name}: {d.message}")
+                        if args.sound and d.status == "done":
+                            play_done_sound()
                 display.draw()
                 time.sleep(FRAME_INTERVAL)
         except KeyboardInterrupt:
@@ -1678,6 +1766,8 @@ def run_downloads(downloads: list[Download], args) -> int:
     if args.notify and outcome != "interrupted":
         notify_summary(downloads, outcome)
     code = report(downloads, outcome, args)
+    if args.sound and outcome != "interrupted" and any(d.status == "done" for d in downloads):
+        play_done_sound()
     if args.then and outcome != "interrupted":
         power_off(args.then)
     return code

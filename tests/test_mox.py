@@ -37,6 +37,7 @@ import tempfile
 import threading
 import time
 import unittest
+import wave
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -269,7 +270,8 @@ class MoxTest(unittest.TestCase):
         self.out = self.temp_dir("mox-out-")
         # Keep the history these runs write away from the real one. Subprocesses inherit this.
         self.data = self.temp_dir("mox-data-")
-        for name, value in (("XDG_DATA_HOME", self.data), ("APPDATA", self.data), ("MOX_NO_HISTORY", None)):
+        for name, value in (("XDG_DATA_HOME", self.data), ("APPDATA", self.data), ("XDG_CACHE_HOME", self.data),
+                            ("MOX_NO_HISTORY", None), ("MOX_SOUND", None)):
             self.addCleanup(restore_env, name, os.environ.get(name))
             if value is None:
                 os.environ.pop(name, None)
@@ -546,6 +548,24 @@ class MoxTest(unittest.TestCase):
         # The bar is the piece map: the first piece is 60% done, the second not started.
         self.assertRegex(output, "\x1b\\[38;5;173m━+\x1b\\[0m(\x1b\\[(2;)?38;5;166m━\x1b\\[0m)?\x1b\\[2;37m━+")
 
+    def test_spinner(self):
+        mox = load_mox()
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        display = mox.Display([d], stream=io.StringIO())
+        layout = display._layout([d], 100)
+
+        def icon_at(moment):
+            with mock.patch.object(mox.time, "monotonic", return_value=moment):
+                return re.sub(r"\x1b\[[0-9;]*m", "", display._row(d, layout, 100))[0]
+
+        d.status = "connecting"
+        frames = [icon_at(i * mox.FRAME_INTERVAL) for i in range(len(mox.SPINNER))]
+        self.assertEqual("".join(frames), mox.SPINNER)  # one frame per redraw, all of them
+        d.status, d.total, d.message = "downloading", 1000, mox.OFFLINE_MESSAGE
+        self.assertIn(icon_at(0), mox.SPINNER)
+        d.message = ""
+        self.assertEqual(icon_at(0), "↓")  # moving data shows the arrow, not the spinner
+
     def test_display_redraw_after_resize(self):
         mox = load_mox()
 
@@ -774,6 +794,49 @@ class MoxTest(unittest.TestCase):
         with mock.patch.object(mox.sys, "platform", "win32"):
             self.assertEqual(mox.power_command("shutdown")[:2], ["shutdown", "/s"])
         self.assertEqual(self.mox("--watch", "--then", "shutdown").returncode, 2)
+
+    # -- --sound
+
+    def fake_player(self):
+        """A pw-play stand-in that writes down what it was asked to play. Returns (env, record file)."""
+        tools = self.temp_dir("mox-player-")
+        record = os.path.join(tools, "played")
+        script = os.path.join(tools, "pw-play")
+        with open(script, "w") as f:
+            f.write(f"#!/bin/sh\necho \"$@\" >> {record}\n")
+        os.chmod(script, 0o755)
+        return {**os.environ, "PATH": tools + os.pathsep + os.environ["PATH"]}, record
+
+    def plays(self, *args, env_extra=None):
+        env, record = self.fake_player()
+        env.update(env_extra or {})
+        result = self.run_mox("-d", self.out, *args, f"{self.base}/big.bin", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        deadline = time.monotonic() + 3  # the player runs on its own, after mox may have exited
+        while time.monotonic() < deadline and not os.path.exists(record):
+            time.sleep(0.1)
+        if not os.path.exists(record):
+            return None
+        with open(record) as f:
+            return f.read().strip()
+
+    def test_sound(self):
+        played = self.plays("--sound")
+        self.assertEqual(played, os.path.join(self.data, "mox", "done.wav"))
+        self.assertIsNone(self.plays("-o", "two.bin"))  # off unless asked for
+        self.assertIsNotNone(self.plays("-o", "three.bin", env_extra={"MOX_SOUND": "1"}))
+        self.assertIsNone(self.plays("-o", "four.bin", "--no-sound", env_extra={"MOX_SOUND": "1"}))
+
+    def test_done_sound_is_gentle(self):
+        mox = load_mox()
+        with wave.open(io.BytesIO(mox.done_sound())) as w:
+            self.assertEqual((w.getnchannels(), w.getsampwidth()), (1, 2))
+            frames = w.readframes(w.getnframes())
+            seconds = w.getnframes() / w.getframerate()
+        samples = [int.from_bytes(frames[i:i + 2], "little", signed=True) for i in range(0, len(frames), 2)]
+        self.assertLess(seconds, 0.6)
+        self.assertLessEqual(max(map(abs, samples)), 0.08 * 32767)
+        self.assertEqual((samples[0], samples[-1]), (0, 0))  # no click at either end
 
     # -- mox history
 

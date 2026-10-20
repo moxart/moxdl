@@ -1,4 +1,4 @@
-# mox
+# <img src="https://raw.githubusercontent.com/moxart/moxdl/main/docs/logo.svg" alt="mox" height="56">
 
 [![tests](https://github.com/moxart/moxdl/actions/workflows/test.yml/badge.svg)](https://github.com/moxart/moxdl/actions/workflows/test.yml)
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
@@ -54,7 +54,7 @@ Some servers gain nothing or refuse extra connections. `mox bench URL` measures 
 - Scheduled downloads, such as 2:00 to 7:00 every night, and shutting down or sleeping when they end.
 - `--sort` saves videos, music, pictures and so on in their own folders, and episodes of a series in a folder per show and season.
 - `--quota` pauses after a set amount, and the history shows how much was downloaded today and in the last 7 and 30 days.
-- A desktop notification, or a Telegram message, when the downloads are done.
+- A desktop notification, a Telegram message or a soft sound when the downloads are done.
 - A history of finished downloads, counted by kind: video, audio, images, documents and so on.
 - SOCKS5 and HTTP proxies, with user name and password.
 - An expired link can be replaced with a fresh one without starting over.
@@ -184,6 +184,8 @@ export MOX_TELEGRAM_CHAT=987654321        # your chat id, e.g. from @userinfobot
 
 `MOX_TELEGRAM_API` sets a self-hosted Bot API server instead of `api.telegram.org`.
 
+`--sound` plays a short, low, quiet sound when the downloads end, if at least one finished. In `--watch` mode it plays after each file. To have it every time, set `MOX_SOUND=1`; `--no-sound` then turns it off for one run. It plays through `pw-play`, `paplay`, `aplay` or `afplay`, whichever is installed, and `winsound` on Windows.
+
 ### Proxies
 
 ```bash
@@ -237,6 +239,7 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `-q, --quota SIZE` | none | Pause after this much, such as `5G` |
 | `--then ACTION` | | `shutdown` or `sleep` when the downloads end |
 | `-n, --notify` | | Desktop or Telegram notification when done |
+| `--sound` | off | A soft sound when done, `MOX_SOUND=1` for always |
 | `--no-history` | | Leave these downloads out of `mox history` |
 
 Other commands: `mox resume [DIR]` takes the download options above, except `-s`. `mox history` takes `-l [N]`, `-k KIND` and `--clear`. `mox bench URL` takes `-s SECONDS` per round, `-c` for the most connections to try, and `-t`, `-H` and `-x`.
