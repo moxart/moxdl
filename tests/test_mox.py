@@ -10,6 +10,7 @@ Server paths:
     /gone/<file>      403, like an expired signed link
     /alt/<file>       the same file under another URL
     /short/<file>     closes every connection after 1 MB
+    /stall/<file>     sends 256 KB per request, then goes silent for 15 seconds
 
 Every reply carries an ETag, and If-Range is honored, so a file replaced on disk counts as changed.
 
@@ -132,6 +133,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
                     return
                 if mode == "short" and sent >= 1024 * 1024:
+                    self.close_connection = True
+                    return
+                if mode == "stall" and sent >= 256 * 1024:
+                    time.sleep(15)
                     self.close_connection = True
                     return
                 time.sleep(len(chunk) / rate)
@@ -262,6 +267,14 @@ class MoxTest(unittest.TestCase):
 
     def setUp(self):
         self.out = self.temp_dir("mox-out-")
+        # Keep the history these runs write away from the real one. Subprocesses inherit this.
+        self.data = self.temp_dir("mox-data-")
+        for name, value in (("XDG_DATA_HOME", self.data), ("APPDATA", self.data), ("MOX_NO_HISTORY", None)):
+            self.addCleanup(restore_env, name, os.environ.get(name))
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     def temp_dir(self, prefix):
         """A temporary folder that is deleted after the test, pass or fail."""
@@ -338,6 +351,20 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("resumed", result.stderr)
         self.assertDownloaded()
+
+    def test_second_ctrl_c_quits_without_a_traceback(self):
+        proc = subprocess.Popen([sys.executable, MOX, "-d", self.out, f"{self.base}/stall/big.bin"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.5)
+        proc.send_signal(signal.SIGINT)
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll())  # the stalled connections have not noticed the pause yet
+        proc.send_signal(signal.SIGINT)
+        _, stderr = proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 130, stderr)
+        self.assertIn("Quit without waiting", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "big.bin.mox")))
 
     def test_name_from_content_disposition(self):
         result = self.mox(f"{self.base}/named/big.bin")
@@ -517,7 +544,7 @@ class MoxTest(unittest.TestCase):
         self.assertIn("big.bin", lines[0])
         self.assertIn("30.0%", lines[0])
         # The bar is the piece map: the first piece is 60% done, the second not started.
-        self.assertRegex(output, "\x1b\\[96m━+\x1b\\[0m(\x1b\\[(2;)?36m━\x1b\\[0m)?\x1b\\[2;37m━+")
+        self.assertRegex(output, "\x1b\\[38;5;173m━+\x1b\\[0m(\x1b\\[(2;)?38;5;166m━\x1b\\[0m)?\x1b\\[2;37m━+")
 
     def test_display_redraw_after_resize(self):
         mox = load_mox()
@@ -634,6 +661,172 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(Handler.telegram[0]["chat_id"], ["42"])
         self.assertIn("big.bin", Handler.telegram[0]["text"][0])
 
+    # -- no internet
+
+    def test_waits_for_the_internet(self):
+        server = QuietServer(("127.0.0.1", 0), Handler)
+        server.root = self.root
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        env = {**os.environ, "MOX_ONLINE_CHECK": f"127.0.0.1:{closed_port()}"}
+        # -r 1 would give up within seconds if the outage counted against the retries.
+        proc = subprocess.Popen([sys.executable, MOX, "-d", self.out, "-r", "1", "-c", "2", "-l", "2M",
+                                 f"http://127.0.0.1:{port}/short/big.bin"],
+                                env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        time.sleep(1.5)
+        server.shutdown()
+        server.server_close()  # every new connection is refused now, like a dead internet
+        time.sleep(8)
+        if proc.poll() is not None:
+            self.fail(f"mox gave up while the internet was down: {proc.communicate()[1]}")
+        server = QuietServer(("127.0.0.1", port), Handler)
+        server.root = self.root
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        _, stderr = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertDownloaded()
+
+    def test_internet_down(self):
+        mox = load_mox()
+        with mock.patch.dict(os.environ, {"MOX_ONLINE_CHECK": f"127.0.0.1:{closed_port()}"}):
+            self.assertTrue(mox.internet_down(f"http://127.0.0.1:{closed_port()}/x"))
+            self.assertFalse(mox.internet_down(f"{self.base}/big.bin"))  # the server answers
+        with mock.patch.dict(os.environ, {"MOX_ONLINE_CHECK": self.base.split("//")[1]}):
+            self.assertFalse(mox.internet_down(f"http://127.0.0.1:{closed_port()}/y"))  # only the server is down
+
+    # -- --sort, --quota, --then
+
+    def test_sort_into_folders(self):
+        self.assertEqual(self.mox("--sort", "-o", "clip.mp4", f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(self.mox("--sort", f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(sha256(os.path.join(self.out, "Videos", "clip.mp4")), self.digest)
+        self.assertDownloaded()  # a file of no known kind stays in --dir
+
+    def test_sort_series(self):
+        for name in ("Breaking.Bad.S02E05.720p.mkv", "breaking.bad.s02e05.srt", "Breaking.Bad.S03E01.mkv"):
+            result = self.mox("--sort", "-o", name, f"{self.base}/big.bin")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        show = os.path.join(self.out, "Series", "Breaking Bad")
+        self.assertEqual(sorted(os.listdir(os.path.join(show, "Season 02"))),
+                         ["Breaking.Bad.S02E05.720p.mkv", "breaking.bad.s02e05.srt"])
+        self.assertEqual(os.listdir(os.path.join(show, "Season 03")), ["Breaking.Bad.S03E01.mkv"])
+        # A folder that differs only in case is reused rather than doubled.
+        os.makedirs(os.path.join(self.out, "Series", "The office"))
+        self.assertEqual(self.mox("--sort", "-o", "THE.OFFICE.S01E01.mkv", f"{self.base}/big.bin").returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "Series", "The office", "Season 01", "THE.OFFICE.S01E01.mkv")))
+
+    def test_episode_of(self):
+        mox = load_mox()
+        self.assertEqual(mox.episode_of("Breaking.Bad.S02E05.720p.BluRay.x264.mkv"), ("Breaking Bad", 2))
+        self.assertEqual(mox.episode_of("breaking.bad.s2e5.mkv"), ("Breaking Bad", 2))
+        self.assertEqual(mox.episode_of("[Group] Doctor.Who.2005.S01.E01.mkv"), ("Doctor Who 2005", 1))
+        self.assertEqual(mox.episode_of("friends.1x02.avi"), ("Friends", 1))
+        self.assertEqual(mox.episode_of("Dark Season 3 Episode 12.mkv"), ("Dark", 3))
+        self.assertEqual(mox.episode_of("شهرزاد فصل ۲ قسمت ۵.mp4"), ("شهرزاد", 2))
+        self.assertEqual(mox.episode_of("Shahrzad.Fasl.2.Ghesmat.05.mkv"), ("Shahrzad", 2))
+        self.assertIsNone(mox.episode_of("Movie.2019.1920x1080.mkv"))
+        self.assertIsNone(mox.episode_of("S01E01.mkv"))  # no show name to make a folder of
+
+    def test_sort_then_resume(self):
+        result = self.mox("--sort", "-o", "song.mp3", "-l", "2M", "--until", clock_in(2), f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "Music", "song.mp3.mox")))
+        result = self.run_mox("resume", self.out)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sha256(os.path.join(self.out, "Music", "song.mp3")), self.digest)
+        self.assertEqual(os.listdir(os.path.join(self.out, "Music")), ["song.mp3"])
+        result = self.mox("--sort", "-o", "Dark.S01E02.mkv", "-l", "2M", "--until", clock_in(2), f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(self.run_mox("resume", self.out).returncode, 0)
+        self.assertEqual(sha256(os.path.join(self.out, "Series", "Dark", "Season 01", "Dark.S01E02.mkv")), self.digest)
+
+    def test_quota(self):
+        result = self.mox("--quota", "3M", "-l", "4M", f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("--quota 3.0 MB", result.stderr)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "big.bin.mox")))
+        result = self.mox(f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertDownloaded()
+        # The history counts what both runs received, the unfinished first run included.
+        self.assertRegex(self.run_mox("history").stdout, r"Received \d+\.\d MB today")
+        self.assertEqual(self.mox("--quota", "lots", f"{self.base}/big.bin").returncode, 2)
+
+    def test_then(self):
+        mox = load_mox()
+        mox.THEN_DELAY = 0
+        tools = self.temp_dir("mox-tools-")
+        called = os.path.join(tools, "called")
+        script = os.path.join(tools, "systemctl")
+        with open(script, "w") as f:
+            f.write(f"#!/bin/sh\necho \"$@\" > {called}\n")
+        os.chmod(script, 0o755)
+        with mock.patch.object(mox.sys, "platform", "linux"), \
+                mock.patch.dict(os.environ, {"PATH": tools}), mock.patch.object(mox.sys, "stderr", io.StringIO()):
+            mox.power_off("sleep")
+        with open(called) as f:
+            self.assertEqual(f.read().strip(), "suspend")
+        with mock.patch.object(mox.sys, "platform", "darwin"):
+            self.assertEqual(mox.power_command("sleep"), ["pmset", "sleepnow"])
+        with mock.patch.object(mox.sys, "platform", "win32"):
+            self.assertEqual(mox.power_command("shutdown")[:2], ["shutdown", "/s"])
+        self.assertEqual(self.mox("--watch", "--then", "shutdown").returncode, 2)
+
+    # -- mox history
+
+    def history_lines(self):
+        path = os.path.join(self.data, "mox", "history.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [line for line in f.read().splitlines() if '"size"' in line]  # files, not traffic
+
+    def test_history(self):
+        self.assertIn("Nothing downloaded yet", self.run_mox("history").stdout)
+        self.assertEqual(self.mox(f"{self.base}/big.bin?token=s3cret#part").returncode, 0)
+        self.assertEqual(self.mox("-o", "clip.mp4", f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(self.mox("-o", "song.mp3", f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(self.mox("-o", "other.mp4", f"{self.base}/big.bin").returncode, 0)
+        lines = self.history_lines()
+        self.assertEqual(len(lines), 4)
+        self.assertNotIn("s3cret", "".join(lines))  # a signed link's key stays out of the history
+        self.assertIn(f'"url": "{self.base}/big.bin"', lines[0])
+
+        result = self.run_mox("history", "-l")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("4 files", result.stdout)
+        self.assertRegex(result.stdout, r"video\s+2\s+")
+        self.assertRegex(result.stdout, r"audio\s+1\s+")
+        self.assertRegex(result.stdout, r"other\s+1\s+")
+        self.assertIn(os.path.join(self.out, "song.mp3"), result.stdout)
+        self.assertNotIn("song.mp3", self.run_mox("history", "-k", "video", "-l").stdout)
+
+        self.assertEqual(self.run_mox("history", "--clear").returncode, 0)
+        self.assertEqual(self.history_lines(), [])
+        self.assertIn("Nothing downloaded yet", self.run_mox("history").stdout)
+
+    def test_history_turned_off(self):
+        self.assertEqual(self.mox("--no-history", f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(self.mox("-o", "again.bin", f"{self.base}/missing.bin").returncode, 1)
+        os.environ["MOX_NO_HISTORY"] = "1"
+        self.assertEqual(self.mox("-o", "third.bin", f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(self.history_lines(), [])
+        self.assertIn("MOX_NO_HISTORY is set", self.run_mox("history").stdout)
+
+    def test_file_kind(self):
+        mox = load_mox()
+        self.assertEqual(mox.file_kind("Film.MKV"), "video")
+        self.assertEqual(mox.file_kind("photo.jpeg"), "image")
+        self.assertEqual(mox.file_kind("book.pdf"), "document")
+        self.assertEqual(mox.file_kind("backup.tar.gz"), "archive")
+        self.assertEqual(mox.file_kind("setup.exe"), "program")
+        self.assertEqual(mox.file_kind("ubuntu.iso"), "disk image")
+        self.assertEqual(mox.file_kind("download", "video/mp4; codecs=avc1"), "video")
+        self.assertEqual(mox.file_kind("data.bin", "application/octet-stream"), "other")
+
     # -- library
 
     def test_library_download(self):
@@ -643,10 +836,25 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(path, os.path.join(self.out, "big.bin"))
         self.assertDownloaded()
         self.assertTrue(seen)
+        self.assertEqual(self.history_lines(), [])  # only the command keeps a history
         with self.assertRaises(mox.DownloadError):
             mox.download(f"{self.base}/nope.bin", self.out)
         with self.assertRaises(ValueError):
             mox.download(f"{self.base}/big.bin", self.out, limit="fast")
+
+
+def closed_port():
+    """A local port nothing listens on, so connecting to it is refused."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def restore_env(name, value):
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
 
 
 def argparse_namespace(directory):

@@ -12,6 +12,7 @@ import functools
 import hashlib
 import http.client
 import json
+import mimetypes
 import os
 import re
 import shlex
@@ -48,6 +49,14 @@ STALL_TIME = 5.0        # seconds without a single byte before a request counts 
 SLOW_WINDOW = 1.5       # seconds between checks of a connection's speed
 SLOW_RATIO = 0.3        # slower than this share of the average connection counts as slow
 SLOW_RECONNECTS = 3     # reconnect a slow connection at most this many times per piece
+OFFLINE_POLL = 5.0      # seconds between checks for the internet coming back
+ONLINE_CHECKS = (("1.1.1.1", 443), ("8.8.8.8", 443))  # well-known addresses, so checking needs no DNS
+ONLINE_CHECK_TIMEOUT = 3.0
+# Connections that fail together share one check's answer for this long. Longer, and an "online"
+# from just before an outage made its first errors count as retries.
+ONLINE_CHECK_SHARED = 1.0
+OFFLINE_MESSAGE = "no internet, waiting for it to come back"
+THEN_DELAY = 60         # seconds of warning before --then shuts down or sleeps, time to press Ctrl+C
 RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 BUSY_HTTP = {429, 503}  # the server wants fewer connections
 EXPIRED_HTTP = {401, 403, 410}  # what an expired signed link usually returns
@@ -105,6 +114,13 @@ def parse_rate(text: str) -> int:
         raise argparse.ArgumentTypeError(f"invalid rate {text!r} (examples: 500K, 2M)")
     multiplier = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[match.group(2).lower()]
     return int(float(match.group(1)) * multiplier)
+
+
+def parse_size(text: str) -> int:
+    try:
+        return parse_rate(text)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(f"invalid size {text!r} (examples: 500M, 5G)") from None
 
 
 def char_width(ch: str) -> int:
@@ -313,6 +329,56 @@ class KeepAlive:
             self.conn = None
 
 
+def online_checks() -> list[tuple[str, int]]:
+    """Where to look for a working internet. MOX_ONLINE_CHECK=host:port,... replaces the defaults,
+    for networks where those addresses are blocked."""
+    custom = os.environ.get("MOX_ONLINE_CHECK")
+    if not custom:
+        return list(ONLINE_CHECKS)
+    checks = []
+    for item in custom.split(","):
+        host, sep, port = item.strip().rpartition(":")
+        if sep and host and port.isdigit():
+            checks.append((host.strip("[]"), int(port)))
+    return checks
+
+
+def can_connect(host: str, port: int) -> bool:
+    try:
+        if _proxy and _proxy.socks:
+            sock = socks5_connect(_proxy, host, port, ONLINE_CHECK_TIMEOUT)
+        else:
+            sock = socket.create_connection((host, port), ONLINE_CHECK_TIMEOUT)
+    except FatalError:  # the proxy turned down our login: a problem, but the internet is there
+        return True
+    except OSError:
+        return False
+    sock.close()
+    return True
+
+
+_online_lock = threading.Lock()
+_online_cache: dict[tuple[str, int], tuple[float, bool]] = {}  # server -> (when checked, online)
+
+
+def internet_down(url: str) -> bool:
+    """True when neither the server nor any of a few well-known addresses accepts a connection.
+
+    The server alone cannot tell a dead server from a dead internet, and the well-known addresses
+    alone cannot either: during a shutdown a domestic server may work while the rest is cut off.
+    Through an HTTP proxy only the proxy itself can be checked.
+    """
+    parts = urllib.parse.urlsplit(url)
+    server = (parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80))
+    targets = [(_proxy.host, _proxy.port)] if _proxy and not _proxy.socks else [server] + online_checks()
+    with _online_lock:
+        checked, online = _online_cache.get(server, (None, True))
+        if checked is None or time.monotonic() - checked >= ONLINE_CHECK_SHARED:
+            online = any(can_connect(host, port) for host, port in targets)
+            _online_cache[server] = (time.monotonic(), online)
+    return not online
+
+
 def safe_name(name: str) -> str:
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
     name = re.sub(r'[\x00-\x1f<>:"|?*]', "_", name).strip(" .")
@@ -350,7 +416,7 @@ def validator_from(resp) -> str | None:
 
 
 def probe(url, headers, timeout):
-    """Return (final_url, total_size_or_None, supports_ranges, filename, validator_or_None)."""
+    """Return (final_url, total_size_or_None, supports_ranges, filename, validator_or_None, content_type)."""
     try:
         resp = request(url, headers, timeout, start=0)
     except FatalError as e:
@@ -361,13 +427,14 @@ def probe(url, headers, timeout):
         final = resp.geturl()
         name = filename_from(resp, final)
         validator = validator_from(resp)
+        content_type = resp.headers.get("Content-Type", "")
         if resp.status == 206:
             match = re.match(r"bytes\s+\d+-\d+/(\d+)", resp.headers.get("Content-Range", ""))
             if match:
-                return final, int(match.group(1)), True, name, validator
+                return final, int(match.group(1)), True, name, validator, content_type
         length = resp.headers.get("Content-Length", "")
         total = int(length) if length.isdigit() and resp.status == 200 else None
-        return final, total, False, name, validator
+        return final, total, False, name, validator, content_type
 
 
 if hasattr(os, "pwrite"):
@@ -398,8 +465,11 @@ class RateLimiter:
         self.tokens = float(self.capacity)
         self.last = time.monotonic()
         self.lock = threading.Lock()
+        self.used = 0  # bytes received by every download, for --quota and the traffic in the history
 
     def consume(self, n: int) -> None:
+        with self.lock:
+            self.used += n
         if not self.rate:
             return
         while True:
@@ -412,6 +482,77 @@ class RateLimiter:
                     return
                 wait = (n - self.tokens) / self.rate
             time.sleep(wait)
+
+
+# ---------------------------------------------------------------- kinds of files
+
+# Checked before the MIME type: mimetypes calls .zip and .exe "application/...", like everything else.
+KIND_EXTENSIONS = {
+    "archive": {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".tbz2", ".xz", ".txz", ".zst", ".lz4"},
+    "program": {".exe", ".msi", ".apk", ".xapk", ".dmg", ".pkg", ".deb", ".rpm", ".appimage", ".flatpak", ".snap"},
+    "disk image": {".iso", ".img", ".qcow2", ".vmdk", ".vdi"},
+    "document": {".pdf", ".epub", ".mobi", ".azw3", ".djvu", ".doc", ".docx", ".odt", ".rtf", ".txt", ".md",
+                 ".xls", ".xlsx", ".ods", ".csv", ".ppt", ".pptx", ".odp"},
+    "subtitle": {".srt", ".vtt", ".ass", ".ssa", ".sub"},
+}
+KIND_ORDER = ("video", "audio", "image", "document", "archive", "program", "disk image", "subtitle", "other")
+# --sort puts each kind in its own folder; "other" stays in --dir itself.
+SORT_FOLDERS = {"video": "Videos", "audio": "Music", "image": "Pictures", "document": "Documents",
+                "archive": "Archives", "program": "Programs", "disk image": "Disk images", "subtitle": "Subtitles"}
+# Episodes of a series go to Series/<show>/Season NN instead, subtitles included, so players find
+# them next to the video. This is the layout Plex, Jellyfin and Kodi expect.
+SERIES_FOLDER = "Series"
+EPISODE_PATTERNS = [re.compile(pattern, re.I) for pattern in (
+    r"(?<![a-z0-9])s(\d{1,2})[\s._-]?e(\d{1,3})(?!\d)",                    # S02E05, s2e5, S02.E05
+    r"(?<![\dx])(\d{1,2})x(\d{2,3})(?!\d)",                               # 2x05, but not 1920x1080
+    r"season[\s._-]*(\d{1,2})[\s._-]*(?:episode|ep)[\s._-]*(\d{1,3})(?!\d)",
+    r"(?:فصل|fasl)[\s._-]*(\d{1,2})[\s._-]*(?:قسمت|اپیزود|ghesmat|qesmat)[\s._-]*(\d{1,3})(?!\d)",
+)]
+PERSIAN_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def file_kind(name: str, content_type: str = "") -> str:
+    """Video, audio, image and so on, from the file name, or from the server's Content-Type if that says nothing."""
+    ext = os.path.splitext(name)[1].lower()
+    for kind, extensions in KIND_EXTENSIONS.items():
+        if ext in extensions:
+            return kind
+    for mime in (mimetypes.guess_type(name)[0] or "", content_type.split(";")[0].strip().lower()):
+        major = mime.split("/")[0]
+        if major in ("video", "audio", "image"):
+            return major
+        if major == "text" or mime in ("application/pdf", "application/epub+zip"):
+            return "document"
+    return "other"
+
+
+def episode_of(name: str) -> tuple[str, int] | None:
+    """('Breaking Bad', 2) for 'Breaking.Bad.S02E05.720p.mkv': the show and season, if the name is an episode's."""
+    stem = os.path.splitext(name)[0].translate(PERSIAN_DIGITS)
+    for pattern in EPISODE_PATTERNS:
+        match = pattern.search(stem)
+        if match:
+            break
+    else:
+        return None
+    show = re.sub(r"^(\s*\[[^\]]*\])+", "", stem[:match.start()])  # release tags such as [Group]
+    show = re.sub(r'[<>:"/\\|?*]', "", re.sub(r"[._\s]+", " ", show)).strip(" -–")
+    if not show:
+        return None
+    if show.islower() or show.isupper():  # so breaking.bad and BREAKING.BAD share Breaking Bad
+        show = show.title()
+    return show, int(match.group(1))
+
+
+def folder_named(parent: str, name: str) -> str:
+    """`name`, or a folder already in `parent` that differs from it only in case, such as 'The office'."""
+    try:
+        for entry in os.listdir(parent):
+            if entry.casefold() == name.casefold() and os.path.isdir(os.path.join(parent, entry)):
+                return entry
+    except OSError:
+        pass
+    return name
 
 
 # ---------------------------------------------------------------- download
@@ -430,6 +571,9 @@ class Download:
         self.done = 0
         self.ranges = False
         self.validator: str | None = None
+        self.content_type = ""
+        self.kind = "other"
+        self.dir = opts.dir  # --dir, or the folder --sort picks for this kind of file
         self.active = 0
         self.path: str | None = None
         self.segments: list[dict] = []
@@ -476,9 +620,12 @@ class Download:
         if info is None:
             self.status = "paused"
             return
-        self.final_url, self.total, self.ranges, server_name, self.validator = info
+        self.final_url, self.total, self.ranges, server_name, self.validator, self.content_type = info
         if not self.custom_name:
             self.name = server_name
+        self.kind = file_kind(self.name, self.content_type)
+        if getattr(self.opts, "sort", False):
+            self.dir = self._sorted_dir()
         self.path = self._choose_path()
         self.name = os.path.basename(self.path)
         if self.status == "done":
@@ -527,6 +674,18 @@ class Download:
         os.replace(part_path, self.path)
         self._remove(state_path)
         self.status = "done"
+        if getattr(self.opts, "history", False):  # download() leaves it out: a library keeps no history
+            record_history(self)
+
+    def _sorted_dir(self) -> str:
+        episode = episode_of(self.name) if self.kind in ("video", "subtitle") else None
+        if episode:
+            show, season = episode
+            series = os.path.join(self.opts.dir, SERIES_FOLDER)
+            return os.path.join(series, folder_named(series, show), f"Season {season:02}")
+        if self.kind in SORT_FOLDERS:
+            return os.path.join(self.opts.dir, SORT_FOLDERS[self.kind])
+        return self.opts.dir
 
     def _probe(self, stop):
         attempts = 0
@@ -534,6 +693,9 @@ class Download:
             try:
                 return probe(self.url, self.opts.headers, self.opts.timeout)
             except RETRYABLE_ERRORS as e:
+                if self._wait_while_offline(e, stop):
+                    attempts = 0
+                    continue
                 attempts += 1
                 if attempts > self.opts.retries:
                     raise FatalError(f"cannot connect: {reason(e)}") from None
@@ -542,8 +704,8 @@ class Download:
         return None
 
     def _choose_path(self) -> str:
-        os.makedirs(self.opts.dir, exist_ok=True)
-        path = os.path.join(self.opts.dir, self.name)
+        os.makedirs(self.dir, exist_ok=True)
+        path = os.path.join(self.dir, self.name)
         base, ext = os.path.splitext(path)
         counter = 1
         with _claim_lock:
@@ -819,15 +981,32 @@ class Download:
                     link.close()
                 if self._server_busy(e) and self.active > MIN_ACTIVE:
                     raise Retire from None
-                attempts = 1 if received else attempts + 1
+                offline = self._wait_while_offline(e, stop)
+                attempts = 0 if offline else 1 if received else attempts + 1
                 if attempts > self.opts.retries:
                     raise FatalError(f"gave up after {self.opts.retries} retries: {reason(e)}") from None
                 if not self.ranges:  # no way to continue mid-file; start over
                     with self.lock:
                         self.done -= seg["done"]
                         seg["done"] = 0
-                self.message = f"retry {attempts}: {reason(e)}"
-                stop.wait(min(2**attempts, 30))
+                if not offline:
+                    self.message = f"retry {attempts}: {reason(e)}"
+                    stop.wait(min(2**attempts, 30))
+
+    def _wait_while_offline(self, e: BaseException, stop) -> bool:
+        """If the internet is down, wait for it to come back without spending retries. True if it was down.
+
+        Retries alone used to give up after about four minutes without internet, so a night
+        download failed on the first long outage while nobody was there to restart it.
+        """
+        if isinstance(e, (ServerBusy, urllib.error.HTTPError)) or not internet_down(self.final_url):
+            return False  # the server answered, so the internet works
+        self.message = OFFLINE_MESSAGE
+        while not self._halted(stop) and internet_down(self.final_url):
+            stop.wait(OFFLINE_POLL)
+        if self.message == OFFLINE_MESSAGE:
+            self.message = ""
+        return True
 
     def _is_slow(self, my_speed: float) -> bool:
         if self.active < 2 or self.opts.limit:  # with a speed cap, slowness is on purpose
@@ -878,7 +1057,8 @@ STYLE = {  # status: (icon, ANSI color)
 BAR = "━"           # every cell of the progress bar; its color says how much of that cell is done
 # By shade: nothing, some, most, all of the cell's bytes on disk. Marking the cells connections
 # were writing to made the bar solid white once there were more connections than cells.
-BAR_COLORS = ("2;37", "2;36", "36", "96")
+# Copper uses the 256-color palette: 24-bit color is missing from some terminals, macOS Terminal among them.
+BAR_COLORS = ("2;37", "2;38;5;166", "38;5;166", "38;5;173")
 BAR_MIN, BAR_GOOD, BAR_MAX = 10, 20, 40  # past BAR_MAX a bar only spreads the same information thinner
 NAME_MIN = 16       # narrower than this and rows drop columns to keep the name readable
 NAME_WANT = 40      # names get this much before the bar grows past BAR_MIN
@@ -912,6 +1092,7 @@ class Display:
         self.stream = stream
         self.tty = stream.isatty()
         self.watching = watching
+        self.stopping = False  # Ctrl+C was pressed and the workers are winding down
         self.drawn: list[int] = []  # screen width of each row of the last frame
         self.reported: dict[int, str] = {}
 
@@ -977,7 +1158,7 @@ class Display:
         if bar_width:
             parts.append(("  ", ""))
             parts.extend(self._bar(d, bar_width) if d.status != "done" else [(" " * bar_width, "")])
-        if d.status == "downloading" and not d.message.startswith("retry"):
+        if d.status == "downloading" and not d.message.startswith(("retry", OFFLINE_MESSAGE)):
             speed = d.speed()
             left = (d.total - d.done) / speed if d.total and speed > 0 else None
             values = [percent(d), f"{human_size(speed)}/s", human_time(left),
@@ -986,7 +1167,7 @@ class Display:
         else:
             if d.status == "done":
                 note, style = f"{d.message or 'done'} · {human_size(d.total or d.done)}", "2"
-            elif d.status == "downloading":  # retrying
+            elif d.status == "downloading":  # retrying, or waiting for the internet
                 note, style = d.message, "33"
             else:
                 note, style = d.message or d.status, "2"
@@ -1025,7 +1206,9 @@ class Display:
             parts.append(f"{counts['error']} failed")
         if speed:
             parts.append(f"{human_size(speed)}/s total")
-        if self.watching:
+        if self.stopping:
+            parts.append("pausing, saving progress · Ctrl+C again to quit now")
+        elif self.watching:
             parts.append("watching the clipboard for links · Ctrl+C to stop")
         elif any(d.status in ("waiting", "connecting", "downloading") for d in self.downloads):
             parts.append("Ctrl+C to pause")
@@ -1094,6 +1277,14 @@ def add_download_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("-n", "--notify", action="store_true",
                         help="when downloads end, send a desktop notification, and a Telegram message "
                              "if MOX_TELEGRAM_TOKEN and MOX_TELEGRAM_CHAT are set")
+    parser.add_argument("-q", "--quota", type=parse_size, metavar="SIZE",
+                        help="pause once this run has downloaded this much, e.g. 5G")
+    parser.add_argument("--then", choices=("shutdown", "sleep"),
+                        help=f"when the downloads end, shut down or sleep the computer, after {THEN_DELAY} "
+                             "seconds to cancel with Ctrl+C")
+    parser.add_argument("--no-history", dest="history", action="store_false",
+                        help="do not add these downloads to the history ('mox history'); "
+                             "MOX_NO_HISTORY=1 turns it off for good")
 
 
 def check_network_options(parser: argparse.ArgumentParser, args) -> None:
@@ -1119,6 +1310,8 @@ def check_download_options(parser: argparse.ArgumentParser, args) -> None:
     if args.at is not None and args.at == args.until:
         parser.error("--at and --until must differ")
     check_network_options(parser, args)
+    if history_disabled():
+        args.history = False
 
 
 def parse_args(argv):
@@ -1126,6 +1319,7 @@ def parse_args(argv):
         prog="mox", description="Fast, resumable, multi-connection downloads in the terminal.",
         epilog="Interrupted downloads resume automatically: run the same command again. "
                "Other commands: 'mox resume [DIR]' continues every unfinished download in a folder, "
+               "'mox history' shows what you have downloaded, "
                "'mox bench URL' measures how much faster many connections are.")
     parser.add_argument("urls", nargs="*", metavar="URL")
     parser.add_argument("-i", "--input", metavar="FILE", help="read URLs from FILE, one per line ('-' for stdin)")
@@ -1134,6 +1328,9 @@ def parse_args(argv):
     parser.add_argument("--sha256", metavar="HEX", help="verify the file against this checksum (single URL only)")
     parser.add_argument("-w", "--watch", action="store_true",
                         help="keep running and download every file link you copy to the clipboard")
+    parser.add_argument("-s", "--sort", action="store_true",
+                        help="save each kind of file in its own folder in --dir: Videos, Music, Pictures, "
+                             "Documents, Archives, Programs and so on, and episodes in Series/<show>/Season NN")
     add_download_options(parser)
     parser.add_argument("-V", "--version", action="version", version=f"mox {VERSION}")
     args = parser.parse_args(argv)
@@ -1148,8 +1345,8 @@ def parse_args(argv):
         parser.error("give at least one URL (or -i FILE, or --watch)")
     if (len(urls) > 1 or args.watch) and (args.output or args.sha256):
         parser.error("--output and --sha256 work with a single URL only")
-    if args.watch and (args.at or args.until):
-        parser.error("--watch cannot be combined with --at or --until")
+    if args.watch and (args.at or args.until or args.quota or args.then):
+        parser.error("--watch cannot be combined with --at, --until, --quota or --then")
     check_download_options(parser, args)
     args.urls = urls
     return args
@@ -1234,6 +1431,8 @@ def notify_summary(downloads: list[Download], outcome: str) -> None:
     unfinished = [d for d in downloads if d.status in ("paused", "waiting")]
     if outcome == "deadline" and unfinished:
         title = f"mox stopped as scheduled, {len(unfinished)} unfinished"
+    elif outcome == "quota" and unfinished:
+        title = f"mox reached the --quota, {len(unfinished)} unfinished"
     elif failed:
         title = f"mox: {len(done)} done, {len(failed)} failed"
     else:
@@ -1241,6 +1440,56 @@ def notify_summary(downloads: list[Download], outcome: str) -> None:
     names = [d.name for d in done + failed][:5]
     more = len(done) + len(failed) - len(names)
     notify(title, "\n".join(names) + (f"\nand {more} more" if more > 0 else ""))
+
+
+# ---------------------------------------------------------------- --then
+
+def power_command(action: str) -> list[str] | None:
+    """The command that shuts down ("shutdown") or sleeps ("sleep") this computer without sudo."""
+    if sys.platform == "win32":
+        # SetSuspendState hibernates instead when hibernation is turned on.
+        return ["shutdown", "/s", "/t", "0"] if action == "shutdown" \
+            else ["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"]
+    if sys.platform == "darwin":
+        return ["osascript", "-e", 'tell application "System Events" to shut down'] if action == "shutdown" \
+            else ["pmset", "sleepnow"]
+    for tool in ("systemctl", "loginctl"):
+        if shutil.which(tool):
+            return [tool, "poweroff" if action == "shutdown" else "suspend"]
+    return None
+
+
+def power_off(action: str) -> None:
+    """Shut down or sleep after THEN_DELAY seconds, unless Ctrl+C is pressed first."""
+    command = power_command(action)
+    if not command:
+        print(f"! --then {action}: no way to do that on this system was found", file=sys.stderr)
+        return
+    verb = "Shutting down" if action == "shutdown" else "Going to sleep"
+    tty = sys.stderr.isatty()
+    if not tty:
+        print(f"{verb} in {THEN_DELAY} seconds. Ctrl+C to cancel.", file=sys.stderr, flush=True)
+    deadline = time.monotonic() + THEN_DELAY
+    try:
+        while (left := deadline - time.monotonic()) > 0:
+            if tty:
+                sys.stderr.write(f"\r\x1b[2K{verb} in {left:.0f} seconds · Ctrl+C to cancel")
+                sys.stderr.flush()
+            time.sleep(min(1.0, left))
+    except KeyboardInterrupt:
+        print(f"\r\x1b[2K‖ Cancelled: not {'shutting down' if action == 'shutdown' else 'going to sleep'}."
+              if tty else "‖ Cancelled.", file=sys.stderr)
+        return
+    if tty:
+        sys.stderr.write("\r\x1b[2K")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"! --then {action} failed: {e}", file=sys.stderr)
+        return
+    if result.returncode != 0:
+        print(f"! --then {action} failed: {result.stderr.strip() or f'{command[0]} exited with {result.returncode}'}",
+              file=sys.stderr)
 
 
 # ---------------------------------------------------------------- clipboard
@@ -1283,7 +1532,7 @@ def links_in(text: str) -> list[str]:
 # ---------------------------------------------------------------- running downloads
 
 def run_session(downloads: list[Download], args, limiter: RateLimiter, deadline) -> str:
-    """Run every waiting download. Returns 'finished', 'interrupted' or 'deadline'."""
+    """Run every waiting download. Returns 'finished', 'interrupted', 'deadline' or 'quota'."""
     _claimed_paths.clear()
     stop = threading.Event()
     display = Display(downloads)
@@ -1296,19 +1545,39 @@ def run_session(downloads: list[Download], args, limiter: RateLimiter, deadline)
                 if deadline and outcome == "finished" and datetime.datetime.now() >= deadline:
                     outcome = "deadline"
                     stop.set()
+                if args.quota and outcome == "finished" and limiter.used >= args.quota:
+                    outcome = "quota"
+                    stop.set()
                 display.draw()
                 time.sleep(FRAME_INTERVAL)
         except KeyboardInterrupt:
             outcome = "interrupted"
-            stop.set()
-            while not all(f.done() for f in futures):
-                display.draw()
-                time.sleep(0.1)
+            wind_down(futures, stop, display)
         pool.shutdown(wait=True)
         display.draw()
     finally:
         display.close()
     return outcome
+
+
+def wind_down(futures, stop: threading.Event, display: Display) -> None:
+    """After Ctrl+C: let the workers save their progress and stop. A second Ctrl+C quits at once.
+
+    A connection stuck on a slow server notices `stop` only when its read times out (--timeout),
+    so people pressed Ctrl+C again, and that printed three tracebacks: one from this loop and one
+    from Python joining the worker threads at exit. os._exit skips that join. The state file is
+    saved about every second and replaced atomically, so quitting loses at most that much.
+    """
+    stop.set()
+    display.stopping = True
+    try:
+        while not all(f.done() for f in futures):
+            display.draw()
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        display.close()
+        print("\n‖ Quit without waiting. Run the same command again to continue.", file=sys.stderr, flush=True)
+        os._exit(130)
 
 
 def watch_session(downloads: list[Download], args, limiter: RateLimiter, command: list[str]) -> str:
@@ -1341,10 +1610,7 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
                 display.draw()
                 time.sleep(FRAME_INTERVAL)
         except KeyboardInterrupt:
-            stop.set()
-            while not all(f.done() for f in futures):
-                display.draw()
-                time.sleep(0.1)
+            wind_down(futures, stop, display)
         pool.shutdown(wait=True)
         display.draw()
     finally:
@@ -1353,7 +1619,7 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
 
 
 def expired_link_hint(d: Download) -> str:
-    folder = os.path.dirname(d.path) if d.path else d.opts.dir
+    folder = os.path.dirname(d.path) if d.path else d.dir
     started = os.path.exists(os.path.join(folder or ".", d.name + STATE_SUFFIX))
     query = urllib.parse.urlsplit(d.url).query
     # An unquoted link like 'file.mkv?md5=...&expires=...' reaches mox as 'file.mkv?md5=...': the
@@ -1374,7 +1640,11 @@ def report(downloads: list[Download], outcome: str, args) -> int:
         print(f"✖ {d.name}: {d.message}", file=sys.stderr)
         if d.error_status in EXPIRED_HTTP:
             print(expired_link_hint(d), file=sys.stderr)
-    if unfinished and outcome == "deadline":
+    if unfinished and outcome == "quota":
+        print(f"‖ Stopped after {human_size(args.quota)} as --quota {human_size(args.quota)} asked, "
+              f"with {len(unfinished)} download(s) unfinished. Run the same command again to continue.",
+              file=sys.stderr)
+    elif unfinished and outcome == "deadline":
         print(f"‖ Stopped at {show_clock(args.until)} as scheduled with {len(unfinished)} download(s) unfinished. "
               "Run the same command again to continue.", file=sys.stderr)
     elif unfinished:
@@ -1403,9 +1673,14 @@ def run_downloads(downloads: list[Download], args) -> int:
         print(f"‖ Stopped at {show_clock(args.until)} as scheduled. Carrying on at {show_clock(args.at)}.",
               file=sys.stderr, flush=True)
         downloads = [d.restart() if d.status in ("paused", "waiting") else d for d in downloads]
+    if args.history:
+        record_traffic(limiter.used)
     if args.notify and outcome != "interrupted":
         notify_summary(downloads, outcome)
-    return report(downloads, outcome, args)
+    code = report(downloads, outcome, args)
+    if args.then and outcome != "interrupted":
+        power_off(args.then)
+    return code
 
 
 # ---------------------------------------------------------------- mox resume
@@ -1421,16 +1696,22 @@ def resume_main(argv) -> int:
     configure_proxy(args.proxy)
 
     downloads = []
-    for entry in sorted(os.listdir(args.dir)) if os.path.isdir(args.dir) else []:
-        if not entry.endswith(STATE_SUFFIX):
-            continue
-        try:
-            with open(os.path.join(args.dir, entry), encoding="utf-8") as f:
-                url = json.load(f)["url"]
-        except (OSError, ValueError, KeyError, TypeError):
-            print(f"! skipping {entry}: not a state file mox can read", file=sys.stderr)
-            continue
-        downloads.append(Download(url, args, name=entry[:-len(STATE_SUFFIX)]))
+    # --sort keeps unfinished downloads in the kind folders, next to where they will end up.
+    folders = [args.dir] + [os.path.join(args.dir, sub) for sub in SORT_FOLDERS.values()]
+    folders += sorted(root for root, _, _ in os.walk(os.path.join(args.dir, SERIES_FOLDER)))
+    for folder in folders:
+        for entry in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            if not entry.endswith(STATE_SUFFIX):
+                continue
+            try:
+                with open(os.path.join(folder, entry), encoding="utf-8") as f:
+                    url = json.load(f)["url"]
+            except (OSError, ValueError, KeyError, TypeError):
+                print(f"! skipping {entry}: not a state file mox can read", file=sys.stderr)
+                continue
+            d = Download(url, args, name=entry[:-len(STATE_SUFFIX)])
+            d.dir = folder
+            downloads.append(d)
     if not downloads:
         print(f"No unfinished downloads in {args.dir}.", file=sys.stderr)
         return 0
@@ -1523,7 +1804,7 @@ def bench_main(argv) -> int:
     url = args.url if "://" in args.url else "https://" + args.url
 
     try:
-        final, total, ranges, name, _ = probe(url, args.headers, args.timeout)
+        final, total, ranges, name, _, _ = probe(url, args.headers, args.timeout)
     except (RETRYABLE_ERRORS + (FatalError,)) as e:
         print(f"✖ {reason(e)}", file=sys.stderr)
         return 1
@@ -1563,6 +1844,162 @@ def bench_main(argv) -> int:
               "A few connections, -c 4, are plenty.")
     if rough:
         print("The file is small enough to finish within a round, so these numbers are rough.")
+    return 0
+
+
+# ---------------------------------------------------------------- mox history
+
+HISTORY_LIST = 20  # rows 'mox history -l' shows without a number
+_history_lock = threading.Lock()  # jobs finish on different threads; one line must not cut into another
+
+
+def history_disabled() -> bool:
+    return os.environ.get("MOX_NO_HISTORY", "") not in ("", "0")
+
+
+def history_path() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "mox", "history.jsonl")
+
+
+def link_without_secrets(url: str) -> str:
+    """The link minus its query, fragment and password: signed links carry their keys there."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if parts.port:
+        host += f":{parts.port}"
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
+def record_history(d: Download) -> None:
+    """Add one finished download to the history."""
+    append_history({"time": datetime.datetime.now().isoformat(timespec="seconds"), "name": d.name,
+                    "path": os.path.abspath(d.path), "size": d.done, "kind": d.kind,
+                    "url": link_without_secrets(d.url)})
+
+
+def record_traffic(received: int) -> None:
+    """Add what a run received, finished or not, so 'mox history' can tell how much of a data plan went."""
+    if received:
+        append_history({"time": datetime.datetime.now().isoformat(timespec="seconds"), "traffic": received})
+
+
+def append_history(entry: dict) -> None:
+    """A failure here must never fail a download."""
+    path = history_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _history_lock, open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def read_history(path: str) -> list[dict]:
+    """Every entry, files and traffic, oldest first. Lines that do not parse, such as one cut short by a full disk, are skipped."""
+    entries = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    entries.append(entry)
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def traffic_line(entries: list[dict]) -> str:
+    """How much was received today and in the last 7 and 30 days, unfinished downloads included.
+
+    Days rather than calendar months: data plans run 30 days from purchase, and the calendar
+    month means different things to different users.
+    """
+    now = datetime.datetime.now()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    spans = [("today", today), ("7 days", now - datetime.timedelta(days=7)),
+             ("30 days", now - datetime.timedelta(days=30))]
+    totals = [0, 0, 0]
+    seen = False
+    for e in entries:
+        received = e.get("traffic")
+        if not isinstance(received, int) or isinstance(received, bool):
+            continue
+        try:
+            when = datetime.datetime.fromisoformat(str(e.get("time")))
+        except ValueError:
+            continue
+        seen = True
+        for i, (_, since) in enumerate(spans):
+            if when >= since:
+                totals[i] += received
+    if not seen:
+        return ""
+    return "Received " + ", ".join(f"{human_size(total)} {'' if label == 'today' else 'in '}{label}"
+                                   for (label, _), total in zip(spans, totals))
+
+
+def history_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mox history", description="Show what mox has downloaded, counted by kind of file.",
+        epilog="Every finished download is added to the history. 'mox --no-history URL' leaves one out, "
+               "and MOX_NO_HISTORY=1 stops keeping a history at all. Links are saved without "
+               "their ?query part, where signed links keep their keys.")
+    parser.add_argument("-l", "--list", nargs="?", type=int, const=HISTORY_LIST, metavar="N",
+                        help=f"also list the last N downloads (default: {HISTORY_LIST})")
+    parser.add_argument("-k", "--kind", choices=KIND_ORDER, help="only this kind of file")
+    parser.add_argument("--clear", action="store_true", help="erase the history")
+    args = parser.parse_args(argv)
+    path = history_path()
+
+    if args.clear:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        print("History erased.")
+        return 0
+
+    everything = read_history(path)
+    entries = [e for e in everything if isinstance(e.get("size"), int) and not isinstance(e.get("size"), bool)]
+    if args.kind:
+        entries = [e for e in entries if e.get("kind") == args.kind]
+    traffic = traffic_line(everything) if not args.kind else ""
+    if not entries:
+        print(f"No {args.kind} files downloaded yet." if args.kind else "Nothing downloaded yet.")
+        if traffic:
+            print(traffic)
+        if history_disabled():
+            print("MOX_NO_HISTORY is set, so mox keeps no history.")
+        return 0
+
+    counts: dict[str, list[int]] = {}
+    for e in entries:
+        kind = e.get("kind") if e.get("kind") in KIND_ORDER else "other"
+        totals = counts.setdefault(kind, [0, 0])
+        totals[0] += 1
+        totals[1] += e["size"]
+    print(f"{len(entries)} file{'s' if len(entries) != 1 else ''}, "
+          f"{human_size(sum(e['size'] for e in entries))}, since {str(entries[0].get('time', ''))[:10]}")
+    for kind in sorted(counts, key=lambda k: (-counts[k][0], KIND_ORDER.index(k))):
+        number, size = counts[kind]
+        print(f"  {kind:<11}{number:>6}  {human_size(size):>9}")
+    if traffic:
+        print(traffic)
+
+    if args.list:
+        print()
+        for e in entries[-args.list:]:
+            when = str(e.get("time", "")).replace("T", " ")[:16]
+            print(f"{when}  {human_size(e['size']):>9}  {e.get('kind', 'other'):<10}  {e.get('path') or e.get('name')}")
     return 0
 
 
@@ -1618,11 +2055,21 @@ def download(url: str, directory: str = ".", *, name: str | None = None,
 # ---------------------------------------------------------------- main
 
 def main(argv=None) -> int:
+    try:
+        return run_command(argv)
+    except KeyboardInterrupt:  # Ctrl+C outside the places that handle it: a short line, not a traceback
+        print("\n‖ Cancelled.", file=sys.stderr)
+        return 130
+
+
+def run_command(argv) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] == "resume":
         return resume_main(argv[1:])
     if argv and argv[0] == "bench":
         return bench_main(argv[1:])
+    if argv and argv[0] == "history":
+        return history_main(argv[1:])
     args = parse_args(argv)
     configure_proxy(args.proxy)
     downloads = [Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
@@ -1633,7 +2080,10 @@ def main(argv=None) -> int:
         print("✖ --watch needs a clipboard tool: wl-clipboard on Wayland, xclip or xsel on X11, "
               "termux-api on Termux. Or set MOX_CLIPBOARD_COMMAND.", file=sys.stderr)
         return 2
-    outcome = watch_session(downloads, args, RateLimiter(args.limit), command)
+    limiter = RateLimiter(args.limit)
+    outcome = watch_session(downloads, args, limiter, command)
+    if args.history:
+        record_traffic(limiter.used)
     return report(downloads, outcome, args)
 
 

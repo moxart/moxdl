@@ -44,7 +44,8 @@ HOLD = 3.0        # seconds the last frame stays up before the loop restarts
 CELL_W, CELL_H, PAD, BAR = 8.4, 19, 16, 28
 PALETTE = {"fg": "#d7dae0", "bg": "#1e2127", "30": "#5c6370", "31": "#e06c75", "32": "#98c379",
            "33": "#e5c07b", "34": "#61afef", "35": "#c678dd", "36": "#56b6c2", "37": "#d7dae0",
-           "96": "#8be9f5", "97": "#ffffff", "dim": "#7f848e", "prompt": "#98c379"}
+           "96": "#8be9f5", "97": "#ffffff", "166": "#d75f00", "173": "#d7875f", "dim": "#7f848e",
+           "prompt": "#98c379"}
 BLOCKS = {"█": 1.0, "▓": 0.72, "▒": 0.45, "░": 0.13}
 LINE = "━"  # mox's progress bar, drawn as a thin rule so it looks like it does in a terminal
 

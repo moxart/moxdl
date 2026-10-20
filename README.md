@@ -47,11 +47,15 @@ Some servers gain nothing or refuse extra connections. `mox bench URL` measures 
 - The progress bar shows which parts of each file are done.
 - Fast connections take over work from slow ones.
 - Very slow connections are reopened.
-- Ctrl+C pauses. Run the same command again, or `mox resume`, to continue, even after a reboot.
+- Ctrl+C pauses. Run the same command again, or `mox resume`, to continue, even after a reboot. A second Ctrl+C quits without waiting for slow connections to close.
 - Retries dropped connections, and uses fewer connections when the server refuses more.
+- Waits out internet outages, however long, and carries on by itself.
 - `--watch` downloads every file link you copy.
-- Scheduled downloads, such as 2:00 to 7:00 every night.
+- Scheduled downloads, such as 2:00 to 7:00 every night, and shutting down or sleeping when they end.
+- `--sort` saves videos, music, pictures and so on in their own folders, and episodes of a series in a folder per show and season.
+- `--quota` pauses after a set amount, and the history shows how much was downloaded today and in the last 7 and 30 days.
 - A desktop notification, or a Telegram message, when the downloads are done.
+- A history of finished downloads, counted by kind: video, audio, images, documents and so on.
 - SOCKS5 and HTTP proxies, with user name and password.
 - An expired link can be replaced with a fresh one without starting over.
 - Starts over if the file on the server has changed.
@@ -115,6 +119,22 @@ mox downloads every file link you copy, and skips links to web pages. Ctrl+C sto
 
 On Linux it needs `wl-paste`, `xclip` or `xsel`. If your clipboard tool isn't supported, set `MOX_CLIPBOARD_COMMAND` to a command that prints the clipboard.
 
+### History
+
+Every finished download is added to a history. `mox history` counts them by kind of file:
+
+```
+$ mox history
+238 files, 31.4 GB, since 2026-03-02
+  image         130    1.2 GB
+  video          42   18.3 GB
+  ...
+```
+
+It also shows how much was received today and in the last 7 and 30 days, unfinished downloads included, to keep an eye on a data plan. `-l` also lists the last 20 downloads with where they were saved (`-l 50` for more), `-k video` shows one kind, and `--clear` erases it all. The history is a text file, `~/.local/share/mox/history.jsonl` (`%APPDATA%\mox` on Windows). Links are saved without their `?query` part, where signed links keep their keys.
+
+To leave a download out, use `--no-history`. To keep no history at all, set `MOX_NO_HISTORY=1`.
+
 ### Night downloads
 
 Download between 2:00 and 7:00 every night until everything is done:
@@ -124,6 +144,30 @@ mox --at 02:00 --until 07:00 -i links.txt
 ```
 
 Leave the terminal open and the computer awake. With only `--until`, mox stops at that time; run the same command later to continue. With only `--at`, it waits and then runs to the end.
+
+Add `--then shutdown` or `--then sleep` to turn the computer off when everything is done. mox counts down a minute first, so Ctrl+C can still cancel it.
+
+If the internet goes down, mox waits for it as long as it takes, without using up its retries, and continues by itself. It tells an outage from a dead server by also trying `1.1.1.1` and `8.8.8.8`. Where those are blocked, set `MOX_ONLINE_CHECK` to other addresses, such as `MOX_ONLINE_CHECK=192.0.2.1:443,198.51.100.7:80`.
+
+### Data plans
+
+```bash
+mox --quota 5G -i links.txt
+```
+
+Pauses once 5 GB has come in during this run. Run the same command again to continue. `mox history` shows what you used today and in the last 7 and 30 days.
+
+### Sorting by kind
+
+```bash
+mox --sort -d ~/Downloads -i links.txt
+```
+
+Puts each file in a folder for its kind inside `--dir`: `Videos`, `Music`, `Pictures`, `Documents`, `Archives`, `Programs`, `Disk images` or `Subtitles`. Files of no known kind stay in `--dir`.
+
+Episodes of a series go to `Series/<show>/Season NN`, with their subtitles, the layout Plex, Jellyfin and Kodi expect. mox reads the show and season from the file name: `Breaking.Bad.S02E05.720p.mkv` goes to `Series/Breaking Bad/Season 02`. It understands `S02E05`, `2x05`, `Season 2 Episode 5`, and the Persian `فصل ۲ قسمت ۵`.
+
+`mox resume ~/Downloads` finds unfinished downloads in all these folders too.
 
 ### Notifications
 
@@ -189,11 +233,15 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `--at HH:MM` | | Wait until this time of day before starting |
 | `--until HH:MM` | | Pause at this time of day |
 | `-w, --watch` | | Download every file link copied to the clipboard |
+| `-s, --sort` | | Save each kind of file in its own folder |
+| `-q, --quota SIZE` | none | Pause after this much, such as `5G` |
+| `--then ACTION` | | `shutdown` or `sleep` when the downloads end |
 | `-n, --notify` | | Desktop or Telegram notification when done |
+| `--no-history` | | Leave these downloads out of `mox history` |
 
-Other commands: `mox resume [DIR]` takes the download options above. `mox bench URL` takes `-s SECONDS` per round, `-c` for the most connections to try, and `-t`, `-H` and `-x`.
+Other commands: `mox resume [DIR]` takes the download options above, except `-s`. `mox history` takes `-l [N]`, `-k KIND` and `--clear`. `mox bench URL` takes `-s SECONDS` per round, `-c` for the most connections to try, and `-t`, `-H` and `-x`.
 
-Exit codes are 0 when everything finished, 1 when any download failed, 2 for a usage error, 3 when `--until` stopped unfinished downloads, and 130 when you pressed Ctrl+C.
+Exit codes are 0 when everything finished, 1 when any download failed, 2 for a usage error, 3 when `--until` or `--quota` stopped unfinished downloads, and 130 when you pressed Ctrl+C.
 
 ## Limitations
 
