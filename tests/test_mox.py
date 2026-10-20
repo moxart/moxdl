@@ -838,6 +838,85 @@ class MoxTest(unittest.TestCase):
         self.assertLessEqual(max(map(abs, samples)), 0.08 * 32767)
         self.assertEqual((samples[0], samples[-1]), (0, 0))  # no click at either end
 
+    # -- choosing what downloads first
+
+    def test_scheduler_follows_the_order(self):
+        mox = load_mox()
+        downloads = [FakeDownload(name) for name in "abcd"]
+        queue = mox.Scheduler(downloads, 2, None, threading.Event())
+
+        def running():
+            queue.tick()
+            time.sleep(0.05)  # let paused threads end
+            queue.tick()
+            return sorted(d.name for d, _, _ in queue.running.values())
+
+        self.assertEqual(running(), ["a", "b"])
+        queue.move(3, queue.front())  # d to the front: it starts, and b, now third, makes room
+        self.assertEqual(running(), ["a", "d"])
+        self.assertEqual([d.name for d in downloads], ["d", "a", "b", "c"])
+        self.assertEqual(downloads[2].status, "waiting")  # b, queued again rather than lost
+        queue.toggle_focus(downloads[3])  # c alone
+        self.assertEqual(running(), ["c"])
+        queue.toggle_focus(downloads[3])
+        self.assertEqual(running(), ["a", "d"])
+        queue.stop.set()
+        for _ in range(20):
+            queue.tick()
+            if queue.finished():
+                break
+            time.sleep(0.05)
+        self.assertTrue(queue.finished())
+
+    def test_key_names(self):
+        mox = load_mox()
+        self.assertEqual(mox.Keyboard.names("\x1b[A\x1b[B\x1bOA\r"), ["up", "down", "up", "enter"])
+        self.assertEqual(mox.Keyboard.names("\x1b[1;2A]f\x1b[Cx"), ["move up", "move down", "focus"])
+
+    def test_display_marks_the_selected_row(self):
+        mox = load_mox()
+        downloads = [mox.Download(f"{self.base}/{n}.bin", argparse_namespace(self.out)) for n in "abc"]
+        downloads[0].status, downloads[0].total = "downloading", 1000
+        display = mox.Display(downloads, stream=io.StringIO())
+        display.tty, display.selected = True, 2
+        with mock.patch("shutil.get_terminal_size", return_value=os.terminal_size((100, 24))):
+            display.draw()
+        lines = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", display.stream.getvalue()).splitlines()
+        self.assertTrue(lines[2].startswith("› "))
+        self.assertIn("next", lines[1])
+        self.assertIn("#2", lines[2])
+        self.assertIn("Enter next", lines[3])
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "needs a pseudo-terminal")
+    def test_keys_change_the_order(self):
+        urls = [f"{self.base}/big.bin", f"{self.base}/alt/big.bin", f"{self.base}/short/big.bin"]
+        master, slave = os.openpty()
+        # mox reads keys from /dev/tty, so the pseudo-terminal must be its controlling terminal.
+        # A small launcher claims it, then becomes mox: no fork from this threaded process.
+        launcher = ("import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+                    "os.execv(sys.executable, [sys.executable] + sys.argv[1:])")
+        proc = subprocess.Popen([sys.executable, "-c", launcher, MOX, "-d", self.out, "-j", "1", "-l", "4M", *urls],
+                                stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        self.addCleanup(os.close, master)
+        output = []
+        threading.Thread(target=drain, args=(master, output), daemon=True).start()
+        time.sleep(1.2)  # the first file is under way
+        os.write(master, b"\x1b[B\x1b[B\r")  # down, down, Enter: the third file next
+        try:
+            code = proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.fail("mox did not finish: " + b"".join(output)[-2000:].decode(errors="replace"))
+        self.assertEqual(code, 0, b"".join(output)[-2000:].decode(errors="replace"))
+        finished = [line for line in self.history_lines()]
+        self.assertEqual([re.search(r'"url": "([^"]+)"', line).group(1) for line in finished],
+                         [urls[2], urls[0], urls[1]])
+        names = sorted(n for n in os.listdir(self.out))
+        self.assertEqual(names, ["big (1).bin", "big (2).bin", "big.bin"])  # nothing started over
+        for name in names:
+            self.assertEqual(sha256(os.path.join(self.out, name)), self.digest)
+
     # -- mox history
 
     def history_lines(self):
@@ -904,6 +983,33 @@ class MoxTest(unittest.TestCase):
             mox.download(f"{self.base}/nope.bin", self.out)
         with self.assertRaises(ValueError):
             mox.download(f"{self.base}/big.bin", self.out, limit="fast")
+
+
+class FakeDownload:
+    """Stands in for mox.Download in scheduler tests: 'downloads' until told to stop."""
+
+    def __init__(self, name):
+        self.name, self.status, self.path = name, "waiting", None
+
+    def run(self, stop, limiter):
+        self.status = "downloading"
+        stop.wait()
+        self.status = "paused"
+
+    def requeue(self):
+        return FakeDownload(self.name)
+
+
+def drain(fd, into):
+    """Read a pseudo-terminal until it closes, so the program writing to it never blocks."""
+    while True:
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            return
+        if not data:
+            return
+        into.append(data)
 
 
 def closed_port():

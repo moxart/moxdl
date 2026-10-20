@@ -51,6 +51,7 @@ Some servers gain nothing or refuse extra connections. `mox bench URL` measures 
 - Retries dropped connections, and uses fewer connections when the server refuses more.
 - Waits out internet outages, however long, and carries on by itself.
 - `--watch` downloads every file link you copy.
+- Pick what downloads first with the arrow keys while it runs.
 - Scheduled downloads, such as 2:00 to 7:00 every night, and shutting down or sleeping when they end.
 - `--sort` saves videos, music, pictures and so on in their own folders, and episodes of a series in a folder per show and season.
 - `--quota` pauses after a set amount, and the history shows how much was downloaded today and in the last 7 and 30 days.
@@ -108,6 +109,19 @@ mox resume ~/Downloads
 ```
 
 It takes the same options as a normal download, such as `-c`, `-l` or `--until`.
+
+### Choosing what downloads first
+
+With several downloads in a run, the arrow keys reorder them while they run:
+
+| Key | Does |
+| --- | --- |
+| ↑ ↓ | Select a download |
+| Enter | Download it next |
+| Shift+↑ Shift+↓, or `[` `]` | Move it one place up or down |
+| `f` | Only this one, at full speed, until it is done. `f` again shares the speed again |
+
+If every slot is taken (`-j`, 3 by default), the lowest download in the list pauses to make room. It keeps its progress and continues when its turn comes. Waiting downloads show their place in line.
 
 ### Copy a link, get the file
 

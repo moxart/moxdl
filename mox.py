@@ -17,6 +17,7 @@ import math
 import mimetypes
 import os
 import re
+import select
 import shlex
 import shutil
 import socket
@@ -32,7 +33,6 @@ import urllib.parse
 import urllib.request
 import wave
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 
 VERSION = "1.5"
 CHUNK = 256 * 1024
@@ -592,7 +592,17 @@ class Download:
 
     def restart(self) -> Download:
         """A fresh copy that picks up from the saved state file, for the next scheduled session."""
-        return Download(self.url, self.opts, self.custom_name, self.sha256)
+        fresh = Download(self.url, self.opts, self.custom_name, self.sha256)
+        fresh.dir = self.dir  # mox resume finds some in --sort folders, which its options do not name
+        return fresh
+
+    def requeue(self) -> Download:
+        """A fresh copy to start again later that, until then, shows how far this one got."""
+        fresh = self.restart()
+        fresh.name, fresh.total, fresh.done, fresh.kind = self.name, self.total, self.done, self.kind
+        with self.lock:
+            fresh.segments = [{"start": s["start"], "end": s["end"], "done": s["done"]} for s in self.segments]
+        return fresh
 
     def run(self, stop: threading.Event, limiter: RateLimiter) -> None:
         if stop.is_set():
@@ -1097,11 +1107,13 @@ def coverage_map(pieces: list[tuple[int, int]], total: int, width: int) -> list[
 
 
 class Display:
-    def __init__(self, downloads: list[Download], stream=sys.stderr, watching: bool = False):
+    def __init__(self, downloads: list[Download], stream=sys.stderr, watching: bool = False, queue=None):
         self.downloads = downloads
         self.stream = stream
         self.tty = stream.isatty()
         self.watching = watching
+        self.queue = queue  # the Scheduler, for the focus
+        self.selected: int | None = None  # the row the keys act on; None without a keyboard
         self.stopping = False  # Ctrl+C was pressed and the workers are winding down
         self.drawn: list[int] = []  # screen width of each row of the last frame
         self.reported: dict[int, str] = {}
@@ -1114,8 +1126,14 @@ class Display:
         # One column spare: a row that fills the last column leaves some terminals waiting to wrap.
         width = size.columns - 1
         visible = self._visible(max(1, size.lines - 2))
-        layout = self._layout(visible, width)
-        rows = [self._row(d, layout, width) for d in visible]
+        if self.selected is None:
+            layout = self._layout(visible, width)
+            rows = [self._row(d, layout, width) for d in visible]
+        else:  # room for the › that marks the selected row
+            layout = self._layout(visible, width - 2)
+            chosen = self.downloads[min(self.selected, len(self.downloads) - 1)] if self.downloads else None
+            rows = [fit([("› " if d is chosen else "  ", SPINNER_COLOR)], 2) + self._row(d, layout, width - 2)
+                    for d in visible]
         rows.append(self._summary(width))
         # After a resize the terminal rewraps the old frame, so a row drawn at 120 columns now
         # takes two rows at 80. Moving up one row per old row left stale copies of the frame
@@ -1140,7 +1158,14 @@ class Display:
             return self.downloads
         rank = {"downloading": 0, "connecting": 0, "verifying": 0, "error": 1, "paused": 1, "waiting": 2, "done": 3}
         chosen = sorted(range(len(self.downloads)), key=lambda i: (rank[self.downloads[i].status], i))[:limit]
+        if self.selected is not None and self.selected < len(self.downloads) and self.selected not in chosen:
+            chosen[-1] = self.selected  # the selected row stays on screen, so the keys never act unseen
         return [self.downloads[i] for i in sorted(chosen)]
+
+    def _place(self, d: Download) -> int:
+        """1 for the download that starts next, 2 after it, and so on."""
+        waiting = [x for x in self.downloads if x.status == "waiting"]
+        return next(i for i, x in enumerate(waiting, 1) if x is d)
 
     @staticmethod
     def _layout(visible: list[Download], width: int) -> tuple[int, int, int]:
@@ -1182,6 +1207,9 @@ class Display:
                 note, style = f"{d.message or 'done'} · {human_size(d.total or d.done)}", "2"
             elif d.status == "downloading":  # retrying, or waiting for the internet
                 note, style = d.message, "33"
+            elif d.status == "waiting" and self.selected is not None:
+                place = self._place(d)
+                note, style = ("next" if place == 1 else f"waiting · #{place}"), "2"
             else:
                 note, style = d.message or d.status, "2"
             parts.append(("  " + ("" if d.status == "done" else percent(d)).rjust(FIELDS[0][0]), ""))
@@ -1219,8 +1247,13 @@ class Display:
             parts.append(f"{counts['error']} failed")
         if speed:
             parts.append(f"{human_size(speed)}/s total")
+        focus = self.queue.focus if self.queue else None
         if self.stopping:
             parts.append("pausing, saving progress · Ctrl+C again to quit now")
+        elif focus is not None:
+            parts.append(f"only {clip(focus.name, 24).rstrip()} until it is done · f to share again")
+        elif self.selected is not None and sum(1 for d in self.downloads if d.status not in ("done", "error")) > 1:
+            parts.append("↑↓ select · Enter next · f only this · Ctrl+C pause")
         elif self.watching:
             parts.append("watching the clipboard for links · Ctrl+C to stop")
         elif any(d.status in ("waiting", "connecting", "downloading") for d in self.downloads):
@@ -1617,36 +1650,214 @@ def links_in(text: str) -> list[str]:
 
 # ---------------------------------------------------------------- running downloads
 
+class Scheduler:
+    """Starts downloads in the order of their list, --jobs at a time, and follows changes to that order.
+
+    The list is the queue, and the keys move downloads up and down in it. A running download
+    that falls out of the first --jobs is paused, its progress safe in its state file, and queued
+    again. With a focus, only the focused download runs until it ends.
+    """
+
+    def __init__(self, downloads: list[Download], jobs: int, limiter: RateLimiter, stop: threading.Event):
+        self.downloads, self.jobs, self.limiter, self.stop = downloads, jobs, limiter, stop
+        self.running: dict[int, tuple[Download, threading.Thread, threading.Event]] = {}
+        self.focus: Download | None = None
+
+    def tick(self) -> None:
+        """Start, pause and requeue downloads to match the list. Called once per frame."""
+        for key, (d, thread, _) in list(self.running.items()):
+            if not thread.is_alive():
+                del self.running[key]
+                if d.status == "paused" and not self.stop.is_set():  # paused to make room, not by Ctrl+C
+                    self._requeue(d)
+        if self.focus is not None and self.focus.status in ("done", "error"):
+            self.focus = None
+        if self.stop.is_set():
+            for _, _, halt in self.running.values():
+                halt.set()
+            return
+        pending = [d for d in self.downloads if d.status not in ("done", "error", "paused")]
+        wanted = [self.focus] if self.focus is not None else pending[:self.jobs]
+        wanted_keys = {id(d) for d in wanted}
+        for key, (_, _, halt) in self.running.items():
+            if key not in wanted_keys:
+                halt.set()
+        for d in wanted:
+            if id(d) not in self.running and d.status == "waiting":
+                halt = threading.Event()  # a stop of its own, so one download can pause alone
+                thread = threading.Thread(target=d.run, args=(halt, self.limiter), name=f"mox {d.name}")
+                self.running[id(d)] = (d, thread, halt)
+                thread.start()
+
+    def finished(self) -> bool:
+        return not self.running and (self.stop.is_set() or not any(d.status == "waiting" for d in self.downloads))
+
+    def front(self) -> int:
+        """Where 'download next' puts a download: above every unfinished one, below the finished."""
+        return next((i for i, d in enumerate(self.downloads) if d.status not in ("done", "error")), 0)
+
+    def move(self, index: int, to: int) -> int:
+        to = max(0, min(len(self.downloads) - 1, to))
+        self.downloads.insert(to, self.downloads.pop(index))
+        return to
+
+    def toggle_focus(self, d: Download) -> None:
+        if d.status not in ("done", "error"):
+            self.focus = None if self.focus is d else d
+
+    def _requeue(self, d: Download) -> None:
+        if d.path:  # free its name, or the new copy would save as 'file (1).mkv' and start over
+            with _claim_lock:
+                _claimed_paths.discard(os.path.abspath(d.path))
+        fresh = d.requeue()
+        self.downloads[next(i for i, x in enumerate(self.downloads) if x is d)] = fresh
+        if self.focus is d:
+            self.focus = fresh
+
+
+class Keyboard:
+    """Keys pressed while downloads run, read without echo or waiting for Enter. Ctrl+C still works.
+
+    Keys come from the terminal itself rather than stdin, since stdin may be the pipe the links
+    came in on (wl-paste | mox -i -).
+    """
+
+    NAMES = {"\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
+             "\x1b[1;2A": "move up", "\x1b[1;2B": "move down", "[": "move up", "]": "move down",
+             "\r": "enter", "\n": "enter", "f": "focus", "F": "focus"}
+    WINDOWS_KEYS = {"H": "\x1b[A", "P": "\x1b[B"}  # what msvcrt gives after "\xe0" for the arrows
+    TOKEN = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO.|\x1b|.", re.S)
+
+    def __init__(self, fd: int | None, saved):
+        self.fd, self.saved = fd, saved
+
+    @classmethod
+    def open(cls) -> Keyboard | None:
+        """The keyboard, or None where there is none to read, such as under cron."""
+        if sys.platform == "win32":
+            try:
+                import msvcrt  # noqa: F401  Windows only, part of the standard library there
+            except ImportError:
+                return None
+            return cls(None, None)
+        try:
+            import termios
+            fd = os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY)
+        except (ImportError, OSError):
+            return None
+        try:
+            saved = termios.tcgetattr(fd)
+            mode = termios.tcgetattr(fd)
+            mode[3] &= ~(termios.ICANON | termios.ECHO)  # ISIG stays on, so Ctrl+C still interrupts
+            mode[6][termios.VMIN], mode[6][termios.VTIME] = 0, 0
+            termios.tcsetattr(fd, termios.TCSANOW, mode)
+        except termios.error:
+            os.close(fd)
+            return None
+        return cls(fd, saved)
+
+    @classmethod
+    def names(cls, text: str) -> list[str]:
+        return [cls.NAMES[token] for token in cls.TOKEN.findall(text) if token in cls.NAMES]
+
+    def wait(self, timeout: float) -> list[str]:
+        """Sleep up to `timeout` seconds, or less if a key comes, and return the keys pressed."""
+        if self.fd is not None:
+            if not select.select([self.fd], [], [], timeout)[0]:
+                return []
+            return self.names(os.read(self.fd, 256).decode(errors="ignore"))
+        import msvcrt
+        deadline = time.monotonic() + timeout
+        text = ""
+        while not text and time.monotonic() < deadline:
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                text += self.WINDOWS_KEYS.get(msvcrt.getwch(), "") if ch in ("\x00", "\xe0") else ch
+            if not text:
+                time.sleep(0.02)
+        return self.names(text)
+
+    def close(self) -> None:
+        if self.fd is not None:
+            import termios
+            try:
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+            except termios.error:
+                pass
+            os.close(self.fd)
+            self.fd = None
+
+
+def open_keyboard(display: Display, worth_it: bool) -> Keyboard | None:
+    """The keys only make sense with a live display and something to reorder."""
+    keyboard = Keyboard.open() if display.tty and worth_it else None
+    if keyboard:
+        display.selected = 0
+    return keyboard
+
+
+def handle_keys(keys: list[str], display: Display, queue: Scheduler) -> None:
+    for key in keys:
+        if not display.downloads:
+            return
+        i = min(display.selected or 0, len(display.downloads) - 1)
+        if key == "up":
+            i = max(0, i - 1)
+        elif key == "down":
+            i = min(len(display.downloads) - 1, i + 1)
+        elif key == "move up":
+            i = queue.move(i, i - 1)
+        elif key == "move down":
+            i = queue.move(i, i + 1)
+        elif key in ("enter", "focus") and display.downloads[i].status not in ("done", "error"):
+            if key == "focus":
+                queue.toggle_focus(display.downloads[i])
+            i = queue.move(i, queue.front())
+        display.selected = i
+
+
+def pause_frame(keyboard: Keyboard | None, display: Display, queue: Scheduler) -> None:
+    """Wait one frame. A key cuts it short, so the screen answers it at once."""
+    if keyboard:
+        handle_keys(keyboard.wait(FRAME_INTERVAL), display, queue)
+    else:
+        time.sleep(FRAME_INTERVAL)
+
+
 def run_session(downloads: list[Download], args, limiter: RateLimiter, deadline) -> str:
     """Run every waiting download. Returns 'finished', 'interrupted', 'deadline' or 'quota'."""
     _claimed_paths.clear()
     stop = threading.Event()
-    display = Display(downloads)
-    pool = ThreadPoolExecutor(max_workers=args.jobs)
-    futures = [pool.submit(d.run, stop, limiter) for d in downloads if d.status == "waiting"]
+    queue = Scheduler(downloads, args.jobs, limiter, stop)
+    display = Display(downloads, queue=queue)
+    keyboard = open_keyboard(display, len(downloads) > 1)
     outcome = "finished"
     try:
         try:
-            while not all(f.done() for f in futures):
+            while True:
                 if deadline and outcome == "finished" and datetime.datetime.now() >= deadline:
                     outcome = "deadline"
                     stop.set()
                 if args.quota and outcome == "finished" and limiter.used >= args.quota:
                     outcome = "quota"
                     stop.set()
+                queue.tick()
+                if queue.finished():
+                    break
                 display.draw()
-                time.sleep(FRAME_INTERVAL)
+                pause_frame(keyboard, display, queue)
         except KeyboardInterrupt:
             outcome = "interrupted"
-            wind_down(futures, stop, display)
-        pool.shutdown(wait=True)
+            wind_down(queue, display, keyboard)
         display.draw()
     finally:
         display.close()
+        if keyboard:
+            keyboard.close()
     return outcome
 
 
-def wind_down(futures, stop: threading.Event, display: Display) -> None:
+def wind_down(queue: Scheduler, display: Display, keyboard: Keyboard | None) -> None:
     """After Ctrl+C: let the workers save their progress and stop. A second Ctrl+C quits at once.
 
     A connection stuck on a slow server notices `stop` only when its read times out (--timeout),
@@ -1654,14 +1865,19 @@ def wind_down(futures, stop: threading.Event, display: Display) -> None:
     from Python joining the worker threads at exit. os._exit skips that join. The state file is
     saved about every second and replaced atomically, so quitting loses at most that much.
     """
-    stop.set()
+    queue.stop.set()
     display.stopping = True
     try:
-        while not all(f.done() for f in futures):
+        while True:
+            queue.tick()
+            if not queue.running:
+                return
             display.draw()
             time.sleep(0.1)
     except KeyboardInterrupt:
         display.close()
+        if keyboard:
+            keyboard.close()  # os._exit skips every finally: the terminal would be left without echo
         print("\n‖ Quit without waiting. Run the same command again to continue.", file=sys.stderr, flush=True)
         os._exit(130)
 
@@ -1671,9 +1887,9 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
     _claimed_paths.clear()
     seen = {d.url for d in downloads} | set(links_in(read_clipboard(command)))  # not what was there before
     stop = threading.Event()
-    display = Display(downloads, watching=True)
-    pool = ThreadPoolExecutor(max_workers=args.jobs)
-    futures = [pool.submit(d.run, stop, limiter) for d in downloads]
+    queue = Scheduler(downloads, args.jobs, limiter, stop)
+    display = Display(downloads, watching=True, queue=queue)
+    keyboard = open_keyboard(display, True)
     announced: set[int] = set()
     last_poll = 0.0
     try:
@@ -1684,9 +1900,8 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
                     for url in links_in(read_clipboard(command)):
                         if url not in seen:
                             seen.add(url)
-                            d = Download(url, args)
-                            downloads.append(d)
-                            futures.append(pool.submit(d.run, stop, limiter))
+                            downloads.append(Download(url, args))
+                queue.tick()
                 for d in downloads:
                     if d.status in ("done", "error") and id(d) not in announced:
                         announced.add(id(d))
@@ -1696,13 +1911,14 @@ def watch_session(downloads: list[Download], args, limiter: RateLimiter, command
                         if args.sound and d.status == "done":
                             play_done_sound()
                 display.draw()
-                time.sleep(FRAME_INTERVAL)
+                pause_frame(keyboard, display, queue)
         except KeyboardInterrupt:
-            wind_down(futures, stop, display)
-        pool.shutdown(wait=True)
+            wind_down(queue, display, keyboard)
         display.draw()
     finally:
         display.close()
+        if keyboard:
+            keyboard.close()
     return "interrupted" if any(d.status in ("paused", "waiting") for d in downloads) else "finished"
 
 
