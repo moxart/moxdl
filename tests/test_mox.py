@@ -737,6 +737,14 @@ class MoxTest(unittest.TestCase):
         os.makedirs(os.path.join(self.out, "Series", "The office"))
         self.assertEqual(self.mox("--sort", "-o", "THE.OFFICE.S01E01.mkv", f"{self.base}/big.bin").returncode, 0)
         self.assertTrue(os.path.exists(os.path.join(self.out, "Series", "The office", "Season 01", "THE.OFFICE.S01E01.mkv")))
+        # Spaces and dots do not make another show either: MrRobot joins Mr Robot.
+        for name in ("Mr.Robot.S04E01.mkv", "MrRobot.S03E01.mkv", "Breaking_Bad.S05E01.mkv"):
+            self.assertEqual(self.mox("--sort", "-o", name, f"{self.base}/big.bin").returncode, 0)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.out, "Series"))), ["Breaking Bad", "Mr Robot", "The office"])
+        robot = os.path.join(self.out, "Series", "Mr Robot")
+        self.assertEqual(sorted(os.listdir(robot)), ["Season 03", "Season 04"])
+        self.assertEqual(os.listdir(os.path.join(robot, "Season 03")), ["MrRobot.S03E01.mkv"])
+        self.assertEqual(os.listdir(os.path.join(show, "Season 05")), ["Breaking_Bad.S05E01.mkv"])
 
     def test_episode_of(self):
         mox = load_mox()

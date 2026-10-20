@@ -550,10 +550,13 @@ def episode_of(name: str) -> tuple[str, int] | None:
 
 
 def folder_named(parent: str, name: str) -> str:
-    """`name`, or a folder already in `parent` that differs from it only in case, such as 'The office'."""
+    """`name`, or a folder already in `parent` that differs from it only in case, spaces or
+    punctuation. Matching case alone gave Mr Robot's third season a second folder, MrRobot,
+    because its files were named MrRobot.S03E01 and the fourth season's Mr.Robot.S04E01."""
+    key = re.sub(r"[\W_]+", "", name.casefold())
     try:
-        for entry in os.listdir(parent):
-            if entry.casefold() == name.casefold() and os.path.isdir(os.path.join(parent, entry)):
+        for entry in sorted(os.listdir(parent)):
+            if re.sub(r"[\W_]+", "", entry.casefold()) == key and os.path.isdir(os.path.join(parent, entry)):
                 return entry
     except OSError:
         pass
@@ -697,7 +700,12 @@ class Download:
         if episode:
             show, season = episode
             series = os.path.join(self.opts.dir, SERIES_FOLDER)
-            return os.path.join(series, folder_named(series, show), f"Season {season:02}")
+            # Pick and make the show's folder in one step: two episodes starting together, one
+            # named MrRobot and one Mr.Robot, would otherwise each find none and make their own.
+            with _claim_lock:
+                folder = os.path.join(series, folder_named(series, show))
+                os.makedirs(folder, exist_ok=True)
+            return os.path.join(folder, f"Season {season:02}")
         if self.kind in SORT_FOLDERS:
             return os.path.join(self.opts.dir, SORT_FOLDERS[self.kind])
         return self.opts.dir
