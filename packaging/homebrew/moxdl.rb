@@ -5,7 +5,7 @@ class Moxdl < Formula
 
   desc "Fast, resumable, multi-connection download manager for the terminal"
   homepage "https://github.com/moxart/moxdl"
-  url "https://github.com/moxart/moxdl/archive/refs/tags/v1.5.tar.gz"
+  url "https://github.com/moxart/moxdl/archive/refs/tags/v1.6.tar.gz"
   sha256 "REPLACE_WITH_THE_SHA256_OF_THE_TARBALL"
   license "MIT"
 

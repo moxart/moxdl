@@ -34,7 +34,7 @@ import urllib.request
 import wave
 from collections import deque
 
-VERSION = "1.5"
+VERSION = "1.6"
 CHUNK = 256 * 1024
 MIN_SPLIT = 256 * 1024  # smallest piece when first dividing a file between connections
 MIN_STEAL = 64 * 1024   # smallest piece an idle connection takes over from a busy one
