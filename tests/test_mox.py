@@ -1385,7 +1385,8 @@ class MoxTest(unittest.TestCase):
 
     def test_engine_keeps_its_list(self):
         state = os.path.join(self.temp_dir("mox-state-"), "queue.json")
-        proc, send, wait_for = self.start_engine("-l", "2M", "--state", state)
+        # Slow enough that neither file can finish before the quit, even on a slow CI machine.
+        proc, send, wait_for = self.start_engine("-l", "512K", "--state", state)
         send(cmd="add", urls=[f"{self.base}/big.bin", f"{self.base}/alt/big.bin"], dir=self.out)
         wait_for("state", lambda e: any(d["done"] > 0 for d in e["downloads"]))
         second = wait_for("state")["downloads"][1]["id"]
@@ -1395,13 +1396,15 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=20), 0)
 
         # Started again with no commands: the first carries on and finishes, the paused one waits.
+        # Watched through the state rather than a finished event, which a fast first file could
+        # have sent before this test was listening.
         proc, send, wait_for = self.start_engine("--state", state)
         rows = wait_for("state")["downloads"]
         self.assertEqual([r["status"] for r in rows][1], "held")
-        self.assertEqual(wait_for("finished")["status"], "done")
+        wait_for("state", lambda e: e["downloads"][0]["status"] == "done", timeout=60)
         self.assertEqual(sha256(os.path.join(self.out, "big.bin")), self.digest)
         send(cmd="hold_all", on=False)
-        self.assertEqual(wait_for("finished")["status"], "done")
+        wait_for("state", lambda e: e["downloads"][1]["status"] == "done", timeout=60)
         self.assertDownloaded("big (1).bin")  # resumed under its own name, and nothing left over
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
