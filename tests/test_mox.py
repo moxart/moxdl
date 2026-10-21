@@ -1313,6 +1313,40 @@ class MoxTest(unittest.TestCase):
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
+    def test_engine_keeps_its_list(self):
+        state = os.path.join(self.temp_dir("mox-state-"), "queue.json")
+        proc, send, wait_for = self.start_engine("-l", "2M", "--state", state)
+        send(cmd="add", urls=[f"{self.base}/big.bin", f"{self.base}/alt/big.bin"], dir=self.out)
+        wait_for("state", lambda e: any(d["done"] > 0 for d in e["downloads"]))
+        second = wait_for("state")["downloads"][1]["id"]
+        send(cmd="hold", id=second, on=True)
+        wait_for("state", lambda e: e["downloads"][1]["status"] == "held")
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+        # Started again with no commands: the first carries on and finishes, the paused one waits.
+        proc, send, wait_for = self.start_engine("--state", state)
+        rows = wait_for("state")["downloads"]
+        self.assertEqual([r["status"] for r in rows][1], "held")
+        self.assertEqual(wait_for("finished")["status"], "done")
+        self.assertEqual(sha256(os.path.join(self.out, "big.bin")), self.digest)
+        send(cmd="hold_all", on=False)
+        self.assertEqual(wait_for("finished")["status"], "done")
+        self.assertDownloaded("big (1).bin")  # resumed under its own name, and nothing left over
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+        # Once more: both show as done, and nothing downloads or announces itself again.
+        proc, send, wait_for = self.start_engine("--state", state)
+        rows = wait_for("state")["downloads"]
+        self.assertEqual([r["status"] for r in rows], ["done", "done"])
+        send(cmd="clear")
+        self.assertEqual(wait_for("state", lambda e: not e["downloads"])["downloads"], [])
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+        with open(state) as f:
+            self.assertEqual(json.load(f)["downloads"], [])
+
     def test_engine_saves_progress_on_quit(self):
         proc, send, wait_for = self.start_engine("-l", "2M")
         send(cmd="add", urls=[f"{self.base}/big.bin"])

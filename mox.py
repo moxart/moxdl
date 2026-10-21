@@ -2872,6 +2872,7 @@ class Engine:
       add        urls: [...] or text (links found anywhere in it), and optionally name, dir,
                  sort, stream, connections
       hold       id, on: pause one download (true) or let it carry on (false)
+      hold_all   on: the same for every unfinished download
       next       id: download it next          move     id, to: put it at that place in the list
       focus      id, or null to share again    stream   id, on: fill it from the start, to watch
       remove     id: off the list, its .part stays     retry   id: start a failed one again
@@ -2885,6 +2886,9 @@ class Engine:
     Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit;
     about four times a second), added (ids), finished (id, status, name, message), notice (text),
     clipboard (urls), config, history, error (text).
+
+    With --state FILE the list outlives the engine: it is written to FILE whenever it changes,
+    and read back on start, where the unfinished downloads carry on from their .mox files.
     """
 
     def __init__(self, args):
@@ -2899,6 +2903,7 @@ class Engine:
         self.finished_since_idle = 0
         self.recorded = 0  # traffic already written to the history
         self.closed = False
+        self.saved: list[dict] | None = None  # the list as last written to --state
 
     # -- the pipe
 
@@ -2920,6 +2925,7 @@ class Engine:
     # -- running
 
     def run(self) -> None:
+        self._restore()
         threading.Thread(target=self._read, name="mox engine input", daemon=True).start()
         self.emit({"type": "hello", "version": VERSION, "settings": read_config(), "jobs": self.queue.jobs,
                    "limit": self.limiter.rate})
@@ -2934,6 +2940,7 @@ class Engine:
                     break
                 self.queue.tick()
                 self._after_tick()
+                self._save_list()
                 if time.monotonic() - last_state >= FRAME_INTERVAL:
                     self.emit(self.state())
                     last_state = time.monotonic()
@@ -2944,7 +2951,64 @@ class Engine:
             self.queue.tick()
             time.sleep(0.1)
         self._record_traffic()
+        self._save_list()
         self.emit(self.state())
+
+    # -- the list across restarts (--state)
+
+    def _entry(self, d: Download) -> dict:
+        """What it takes to show a download again, or to carry on with it."""
+        status = d.status if d.status in ("done", "error") else "waiting"  # paused by quitting carries on
+        return {"url": d.url, "name": d.custom_name, "shown": d.name, "dir": d.opts.dir,
+                "sort": bool(getattr(d.opts, "sort", False)), "stream": d.stream,
+                "connections": d.opts.connections, "held": d.held, "status": status, "path": d.path,
+                "size": d.total if d.total is not None else d.done, "kind": d.kind,
+                "message": d.message if status == "error" else "", "error_status": d.error_status}
+
+    def _save_list(self) -> None:
+        if not getattr(self.args, "state", None):
+            return
+        entries = [self._entry(d) for d in self.downloads]
+        if entries == self.saved:  # progress alone changes nothing here, so this writes rarely
+            return
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(self.args.state)), exist_ok=True)
+            with open(self.args.state + ".new", "w", encoding="utf-8") as f:
+                json.dump({"version": 1, "downloads": entries}, f)
+            os.replace(self.args.state + ".new", self.args.state)
+            self.saved = entries
+        except OSError as e:
+            self.emit({"type": "error", "text": f"could not save the download list: {e.strerror or e}"})
+
+    def _restore(self) -> None:
+        if not getattr(self.args, "state", None):
+            return
+        try:
+            with open(self.args.state, encoding="utf-8") as f:
+                entries = json.load(f)["downloads"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        for entry in entries:
+            try:
+                opts = argparse.Namespace(**{**vars(self.args), "dir": entry["dir"], "sort": entry["sort"],
+                                             "stream": entry["stream"], "connections": entry["connections"]})
+                d = Download(entry["url"], opts, name=entry.get("name"))
+                d.name, d.kind = entry.get("shown") or d.name, entry.get("kind") or d.kind
+                if entry["status"] == "done":
+                    if not (entry.get("path") and os.path.exists(entry["path"])):
+                        continue  # moved or deleted since: nothing to show
+                    d.status, d.path, d.total = "done", entry["path"], entry.get("size")
+                    d.done = d.total or 0
+                    self.announced.add(d.key)  # finished before; no second notification
+                elif entry["status"] == "error":
+                    d.status, d.message, d.error_status = "error", entry.get("message", ""), entry.get("error_status")
+                    self.announced.add(d.key)
+                else:
+                    d.held = bool(entry.get("held"))
+                self.downloads.append(d)
+            except (KeyError, TypeError, ValueError):
+                continue  # one damaged entry costs only itself
+        self.saved = [self._entry(d) for d in self.downloads]
 
     def _after_tick(self) -> None:
         for d in self.downloads:
@@ -3026,6 +3090,12 @@ class Engine:
         d = self.find(c["id"])
         if bool(c.get("on", not d.held)) != d.held and d.status not in ("done", "error"):
             self.queue.toggle_hold(d)
+
+    def cmd_hold_all(self, c: dict) -> None:
+        on = bool(c.get("on", True))
+        for d in list(self.downloads):
+            if d.held != on and d.status not in ("done", "error"):
+                self.queue.toggle_hold(d)
 
     def cmd_next(self, c: dict) -> None:
         d = self.find(c["id"])
@@ -3126,6 +3196,8 @@ def engine_main(argv) -> int:
                                        "commands on stdin, JSON events on stdout. See Engine in mox.py.")
     parser.add_argument("-d", "--dir", default=".", help="default folder to save into (default: current)")
     parser.add_argument("-s", "--sort", action="store_true", help="sort files into folders by kind")
+    parser.add_argument("--state", metavar="FILE",
+                        help="keep the download list in FILE, so it is back, and carrying on, after a restart")
     add_download_options(parser)
     parser.set_defaults(**config_defaults())
     args = parser.parse_args(argv)
