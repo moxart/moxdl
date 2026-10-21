@@ -27,6 +27,12 @@ On Android, in [Termux](https://termux.dev): `pkg install python`, then the `cur
 
 The package is called `moxdl`; the command is `mox`.
 
+### Desktop app
+
+[mox desktop](https://github.com/moxart/moxdl-desktop) puts mox in a window, with mox built in: drag downloads into order, watch one while it downloads, and leave the rest to the icon by the clock. It is a test version, for Linux so far: get the `.deb` or `.AppImage` from its [releases](https://github.com/moxart/moxdl-desktop/releases).
+
+<img src="https://raw.githubusercontent.com/moxart/moxdl-desktop/main/docs/screenshot.png" alt="The mox desktop app downloading a season of a series" width="720">
+
 ## Speed
 
 Many servers cap the speed of each connection, so more connections means more speed. A 100 MB file from a local server that caps each connection at 4 MB/s:

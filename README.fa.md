@@ -20,6 +20,12 @@ pipx install moxdl
 
 روی اندروید با [Termux](https://termux.dev): اول `pkg install python`، بعد همان دستور `curl` بالا، با `$PREFIX/bin/mox` به‌جای `~/.local/bin/mox`.
 
+### برنامهٔ دسکتاپ
+
+اگر پنجره را به ترمینال ترجیح می‌دهی، [mox desktop](https://github.com/moxart/moxdl-desktop) همین mox است در یک پنجره: ترتیب دانلودها را با کشیدن عوض کن، وسط دانلود فیلم را تماشا کن، و پنجره را ببند تا آیکن کنار ساعت ادامه بدهد. فعلاً نسخهٔ آزمایشی و فقط برای لینوکس است. فایل `.deb` یا `.AppImage` را از [صفحهٔ انتشارها](https://github.com/moxart/moxdl-desktop/releases) بگیر. mox داخلش هست و پایتون لازم ندارد.
+
+<img src="https://raw.githubusercontent.com/moxart/moxdl-desktop/main/docs/screenshot.png" alt="برنامهٔ دسکتاپ mox در حال دانلود یک فصل سریال" width="720">
+
 ## چرا؟
 
 بعضی سرورها سرعت هر اتصال را جدا محدود می‌کنند، پس اتصال بیشتر یعنی سرعت بیشتر. IDM هم همین کار را می‌کند.
