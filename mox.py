@@ -599,6 +599,9 @@ SORT_FOLDERS = {"video": "Videos", "audio": "Music", "image": "Pictures", "docum
 # Episodes of a series go to Series/<show>/Season NN instead, subtitles included, so players find
 # them next to the video. This is the layout Plex, Jellyfin and Kodi expect.
 SERIES_FOLDER = "Series"
+# --sort fills one folder of its own inside --dir, rather than --dir itself, so its Series,
+# Videos and Music never mix with folders of those names the user made there.
+SORT_ROOT = "mox"
 EPISODE_PATTERNS = [re.compile(pattern, re.I) for pattern in (
     r"(?<![a-z0-9])s(\d{1,2})[\s._-]?e(\d{1,3})(?!\d)",                    # S02E05, s2e5, S02.E05
     r"(?<![\dx])(\d{1,2})x(\d{2,3})(?!\d)",                               # 2x05, but not 1920x1080
@@ -821,6 +824,8 @@ class Download:
                 self._remove(state_path)
                 raise FatalError(f"SHA-256 mismatch (got {digest[:16]}…), kept {os.path.basename(part_path)}")
             self.message = "SHA-256 verified"
+        self.path = self._keep_free(self.path)  # os.replace would silently write over it
+        self.name = os.path.basename(self.path)
         os.replace(part_path, self.path)
         self._remove(state_path)
         self.status = "done"
@@ -828,18 +833,27 @@ class Download:
             record_history(self)
 
     def _sorted_dir(self) -> str:
+        root = os.path.normpath(os.path.join(self.opts.dir, getattr(self.opts, "sort_root", None) or "."))
+        # Pick and make the folder in one step: two episodes starting together, one named
+        # MrRobot and one Mr.Robot, would otherwise each find no show folder and make their own.
+        with _claim_lock:
+            folder = self._kind_folder(root)
+            # Until 1.8 the folders were made in --dir itself. A download left unfinished there
+            # carries on there, rather than starting over in the new place.
+            before = self._kind_folder(self.opts.dir)
+            if before != folder and os.path.exists(os.path.join(before, self.name + STATE_SUFFIX)):
+                folder = before
+            os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def _kind_folder(self, root: str) -> str:
         episode = episode_of(self.name) if self.kind in ("video", "subtitle") else None
         if episode:
             show, season = episode
-            series = os.path.join(self.opts.dir, SERIES_FOLDER)
-            # Pick and make the show's folder in one step: two episodes starting together, one
-            # named MrRobot and one Mr.Robot, would otherwise each find none and make their own.
-            with _claim_lock:
-                folder = os.path.join(series, folder_named(series, show))
-                os.makedirs(folder, exist_ok=True)
-            return os.path.join(folder, f"Season {season:02}")
+            series = os.path.join(root, SERIES_FOLDER)
+            return os.path.join(series, folder_named(series, show), f"Season {season:02}")
         if self.kind in SORT_FOLDERS:
-            return os.path.join(self.opts.dir, SORT_FOLDERS[self.kind])
+            return os.path.join(root, SORT_FOLDERS[self.kind])
         return self.opts.dir
 
     def _space_needed(self) -> int:
@@ -894,14 +908,30 @@ class Download:
         with _claim_lock:
             while True:
                 if os.path.abspath(path) not in _claimed_paths:
-                    if os.path.exists(path + STATE_SUFFIX) or not os.path.exists(path):
-                        break
-                    if self.total is not None and os.path.isfile(path) and os.path.getsize(path) == self.total:
+                    if not os.path.exists(path):
+                        # Ours to continue, or free. A .part with no .mox beside it is another
+                        # program's download in progress (Firefox names its own that way), and
+                        # starting afresh would have emptied it.
+                        if os.path.exists(path + STATE_SUFFIX) or not os.path.exists(path + PART_SUFFIX):
+                            break
+                    elif self.total is not None and os.path.isfile(path) and os.path.getsize(path) == self.total:
                         self.status, self.message, self.done = "done", "already downloaded", self.total
                         break
+                    # A file of that name is there: never write over it, even with a .mox
+                    # beside it, which once let a stale .mox replace the user's own file.
                 path = f"{base} ({counter}){ext}"
                 counter += 1
             _claimed_paths.add(os.path.abspath(path))
+        return path
+
+    def _keep_free(self, path: str) -> str:
+        """`path`, or the next free 'name (1).ext' if something took the name while downloading."""
+        base, ext = os.path.splitext(path)
+        counter = 1
+        with _claim_lock:
+            while os.path.exists(path):
+                path = f"{base} ({counter}){ext}"
+                counter += 1
         return path
 
     def _plan(self) -> list[dict]:
@@ -1590,6 +1620,7 @@ def check_download_options(parser: argparse.ArgumentParser, args) -> None:
 CONFIG_KEYS = {
     "dir": ("folder to save into", "path"),
     "sort": ("each kind of file in its own folder, series by show and season", "bool"),
+    "sort-root": ("the folder in dir that sort fills (default: mox); . for dir itself", "folder"),
     "stream": ("fill files from the start, to watch while they download", "bool"),
     "connections": ("connections per file", "int"),
     "jobs": ("files downloaded at once", "int"),
@@ -1634,6 +1665,11 @@ def config_value(key: str, text: str):
             return parse_rate(text)
         except argparse.ArgumentTypeError as e:
             raise ValueError(str(e)) from None
+    if kind == "folder":
+        name = text.strip().strip("/\\")
+        if not name or os.path.isabs(text) or ".." in name.replace("\\", "/").split("/"):
+            raise ValueError("use a folder name inside dir, such as mox, or . for dir itself")
+        return name
     if kind == "proxy":
         Proxy(text)  # its ValueError already says what is wrong
         return text
@@ -1763,8 +1799,11 @@ def parse_args(argv):
     parser.add_argument("-w", "--watch", action="store_true",
                         help="keep running and download every file link you copy to the clipboard")
     parser.add_argument("-s", "--sort", action="store_true",
-                        help="save each kind of file in its own folder in --dir: Videos, Music, Pictures, "
-                             "Documents, Archives, Programs and so on, and episodes in Series/<show>/Season NN")
+                        help=f"save each kind of file in its own folder in --dir/{SORT_ROOT}: Videos, Music, "
+                             "Pictures, Documents, Archives, Programs and so on, and episodes in "
+                             "Series/<show>/Season NN")
+    parser.add_argument("--sort-root", metavar="NAME", default=SORT_ROOT,
+                        help=f"the folder in --dir that --sort fills (default: {SORT_ROOT}); . for --dir itself")
     add_download_options(parser)
     parser.add_argument("-V", "--version", action="version", version=f"mox {VERSION}")
     parser.set_defaults(**config_defaults())
@@ -2045,6 +2084,16 @@ def read_clipboard(command: list[str]) -> str:
 def urls_in(text: str) -> list[str]:
     """Every http(s) link in a piece of text, wherever it sits, without the punctuation around it."""
     return [unescape_link(url.rstrip(".,;:)]}>")) for url in URL_PATTERN.findall(text)]
+
+
+def file_link(url: str) -> str:
+    """What names the file a link leads to: its server and path, when the path ends in a file name,
+    since download sites change only the signature in the query. Otherwise the whole link, as
+    download.php?id=1 and ?id=2 are two files."""
+    name = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+    if os.path.splitext(name)[1].lower() in PAGE_EXTENSIONS:
+        return url
+    return link_without_secrets(url)
 
 
 def unescape_link(url: str) -> str:
@@ -2542,8 +2591,11 @@ def resume_main(argv) -> int:
 
     downloads = []
     # --sort keeps unfinished downloads in the kind folders, next to where they will end up.
-    folders = [args.dir] + [os.path.join(args.dir, sub) for sub in SORT_FOLDERS.values()]
-    folders += sorted(root for root, _, _ in os.walk(os.path.join(args.dir, SERIES_FOLDER)))
+    folders = [args.dir]
+    # Where --sort leaves them: in its own folder, or in --dir itself as before 1.8.
+    for root in dict.fromkeys([os.path.join(args.dir, getattr(args, "sort_root", None) or SORT_ROOT), args.dir]):
+        folders += [os.path.join(root, sub) for sub in SORT_FOLDERS.values()]
+        folders += sorted(found for found, _, _ in os.walk(os.path.join(root, SERIES_FOLDER)))
     for folder in folders:
         for entry in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
             if not entry.endswith(STATE_SUFFIX):
@@ -3070,21 +3122,41 @@ class Engine:
         if "dir" in overrides:
             overrides["dir"] = os.path.expanduser(overrides["dir"])
         opts = argparse.Namespace(**{**vars(self.args), **overrides})
-        running = {d.url for d in self.downloads if d.status not in ("done", "error")}
+        known = {file_link(d.url): d for d in self.downloads if d.status != "done"}
         urls = list(c.get("urls") or [])
         for line in str(c.get("text") or "").splitlines():  # pasted text, read the way -i reads a file
             line = line.strip()
             if line and not line.startswith("#"):
                 urls += urls_in(line) if "://" in line else [line]
-        added = []
+        added, refreshed = [], 0
         for url in urls:
             url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
-            if url not in running:  # the same link twice would fight over one file
+            same = known.get(file_link(url))
+            if same is None:
                 d = Download(url, opts, name=c.get("name") if len(urls) == 1 else None)
                 self.downloads.append(d)
-                running.add(url)
+                known[file_link(url)] = d
                 added.append(d.key)
+            elif same.url != url:
+                # The same file under a fresh link: download sites sign each link anew, so a list
+                # copied twice came back as a second row that downloaded the file again, as
+                # "name (1)". The fresh link replaces the old one instead, and restarts the row
+                # if the old link had failed, as an expired one does.
+                refreshed += 1
+                if same.status == "error":
+                    fresh = Download(url, same.opts, same.custom_name, same.sha256)
+                    fresh.key, fresh.dir, fresh.stream, fresh.held = same.key, same.dir, same.stream, same.held
+                    self.downloads[self.downloads.index(same)] = fresh
+                    self.announced.discard(same.key)
+                    known[file_link(url)] = fresh
+                else:
+                    same.url = url  # used from its next connection, and saved in its .mox
+                    if same.status == "waiting":
+                        same.final_url = url
         self.emit({"type": "added", "ids": added})
+        if refreshed:
+            self.emit({"type": "notice", "text": f"{refreshed} already in the list: "
+                                                 f"{'its link was' if refreshed == 1 else 'their links were'} updated"})
 
     def cmd_hold(self, c: dict) -> None:
         d = self.find(c["id"])
@@ -3196,6 +3268,8 @@ def engine_main(argv) -> int:
                                        "commands on stdin, JSON events on stdout. See Engine in mox.py.")
     parser.add_argument("-d", "--dir", default=".", help="default folder to save into (default: current)")
     parser.add_argument("-s", "--sort", action="store_true", help="sort files into folders by kind")
+    parser.add_argument("--sort-root", metavar="NAME", default=SORT_ROOT,
+                        help=f"the folder in --dir that --sort fills (default: {SORT_ROOT}); . for --dir itself")
     parser.add_argument("--state", metavar="FILE",
                         help="keep the download list in FILE, so it is back, and carrying on, after a restart")
     add_download_options(parser)

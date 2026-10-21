@@ -222,11 +222,13 @@ Pauses once 5 GB has come in during this run. Run the same command again to cont
 mox --sort -d ~/Downloads -i links.txt
 ```
 
-Puts each file in a folder for its kind inside `--dir`: `Videos`, `Music`, `Pictures`, `Documents`, `Archives`, `Programs`, `Disk images` or `Subtitles`. Files of no known kind stay in `--dir`.
+Puts each file in a folder for its kind, inside a `mox` folder in `--dir`: `Videos`, `Music`, `Pictures`, `Documents`, `Archives`, `Programs`, `Disk images` or `Subtitles`. Files of no known kind stay in `--dir`. The `mox` folder keeps these apart from any `Series` or `Videos` folder of your own; `--sort-root NAME` picks another name, and `--sort-root .` sorts straight into `--dir`.
 
-Episodes of a series go to `Series/<show>/Season NN`, with their subtitles, the layout Plex, Jellyfin and Kodi expect. mox reads the show and season from the file name: `Breaking.Bad.S02E05.720p.mkv` goes to `Series/Breaking Bad/Season 02`. It understands `S02E05`, `2x05`, `Season 2 Episode 5`, and the Persian `فصل ۲ قسمت ۵`.
+Episodes of a series go to `mox/Series/<show>/Season NN`, with their subtitles, the layout Plex, Jellyfin and Kodi expect. mox reads the show and season from the file name: `Breaking.Bad.S02E05.720p.mkv` goes to `mox/Series/Breaking Bad/Season 02`. It understands `S02E05`, `2x05`, `Season 2 Episode 5`, and the Persian `فصل ۲ قسمت ۵`.
 
-`mox resume ~/Downloads` finds unfinished downloads in all these folders too.
+`mox resume ~/Downloads` finds unfinished downloads in all these folders too. Ones that 1.7 or older left in `--dir` itself carry on there.
+
+mox never writes over a file. A name that is taken, by a file or by another program's `.part` (Firefox names its downloads in progress that way), makes it save as `name (1).ext`.
 
 ### Notifications
 
@@ -318,6 +320,7 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `--until HH:MM` | | Pause at this time of day |
 | `-w, --watch` | | Download every file link copied to the clipboard |
 | `-s, --sort` | | Save each kind of file in its own folder |
+| `--sort-root NAME` | mox | The folder in `--dir` that `--sort` fills, `.` for `--dir` itself |
 | `--stream` | | Fill files from the start, to watch while they download |
 | `-q, --quota SIZE` | none | Pause after this much, such as `5G` |
 | `--then ACTION` | | `shutdown` or `sleep` when the downloads end |

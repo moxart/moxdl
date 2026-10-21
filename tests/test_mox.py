@@ -760,29 +760,77 @@ class MoxTest(unittest.TestCase):
     def test_sort_into_folders(self):
         self.assertEqual(self.mox("--sort", "-o", "clip.mp4", f"{self.base}/big.bin").returncode, 0)
         self.assertEqual(self.mox("--sort", f"{self.base}/big.bin").returncode, 0)
-        self.assertEqual(sha256(os.path.join(self.out, "Videos", "clip.mp4")), self.digest)
+        self.assertEqual(sha256(os.path.join(self.out, "mox", "Videos", "clip.mp4")), self.digest)
         self.assertDownloaded()  # a file of no known kind stays in --dir
 
     def test_sort_series(self):
         for name in ("Breaking.Bad.S02E05.720p.mkv", "breaking.bad.s02e05.srt", "Breaking.Bad.S03E01.mkv"):
             result = self.mox("--sort", "-o", name, f"{self.base}/big.bin")
             self.assertEqual(result.returncode, 0, result.stderr)
-        show = os.path.join(self.out, "Series", "Breaking Bad")
+        show = os.path.join(self.out, "mox", "Series", "Breaking Bad")
         self.assertEqual(sorted(os.listdir(os.path.join(show, "Season 02"))),
                          ["Breaking.Bad.S02E05.720p.mkv", "breaking.bad.s02e05.srt"])
         self.assertEqual(os.listdir(os.path.join(show, "Season 03")), ["Breaking.Bad.S03E01.mkv"])
         # A folder that differs only in case is reused rather than doubled.
-        os.makedirs(os.path.join(self.out, "Series", "The office"))
+        os.makedirs(os.path.join(self.out, "mox", "Series", "The office"))
         self.assertEqual(self.mox("--sort", "-o", "THE.OFFICE.S01E01.mkv", f"{self.base}/big.bin").returncode, 0)
-        self.assertTrue(os.path.exists(os.path.join(self.out, "Series", "The office", "Season 01", "THE.OFFICE.S01E01.mkv")))
+        self.assertTrue(os.path.exists(os.path.join(self.out, "mox", "Series", "The office", "Season 01", "THE.OFFICE.S01E01.mkv")))
         # Spaces and dots do not make another show either: MrRobot joins Mr Robot.
         for name in ("Mr.Robot.S04E01.mkv", "MrRobot.S03E01.mkv", "Breaking_Bad.S05E01.mkv"):
             self.assertEqual(self.mox("--sort", "-o", name, f"{self.base}/big.bin").returncode, 0)
-        self.assertEqual(sorted(os.listdir(os.path.join(self.out, "Series"))), ["Breaking Bad", "Mr Robot", "The office"])
-        robot = os.path.join(self.out, "Series", "Mr Robot")
+        self.assertEqual(sorted(os.listdir(os.path.join(self.out, "mox", "Series"))), ["Breaking Bad", "Mr Robot", "The office"])
+        robot = os.path.join(self.out, "mox", "Series", "Mr Robot")
         self.assertEqual(sorted(os.listdir(robot)), ["Season 03", "Season 04"])
         self.assertEqual(os.listdir(os.path.join(robot, "Season 03")), ["MrRobot.S03E01.mkv"])
         self.assertEqual(os.listdir(os.path.join(show, "Season 05")), ["Breaking_Bad.S05E01.mkv"])
+
+    def test_sort_root(self):
+        # An episode left unfinished where 1.7 sorted, straight into --dir, carries on there.
+        result = self.mox("--sort", "--sort-root", ".", "-o", "Dark.S01E01.mkv", "-l", "2M", "--until", clock_in(2),
+                          f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        old = os.path.join(self.out, "Series", "Dark", "Season 01")
+        self.assertTrue(os.path.exists(os.path.join(old, "Dark.S01E01.mkv.mox")))
+        result = self.mox("--sort", "-o", "Dark.S01E01.mkv", f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("resumed", result.stderr)
+        self.assertEqual(os.listdir(old), ["Dark.S01E01.mkv"])
+        self.assertFalse(os.path.exists(os.path.join(self.out, "mox")))  # nothing started over in the new place
+        # A new one goes to the new place.
+        self.assertEqual(self.mox("--sort", "-o", "Dark.S01E02.mkv", f"{self.base}/big.bin").returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "mox", "Series", "Dark", "Season 01", "Dark.S01E02.mkv")))
+        self.assertEqual(self.mox("--sort-root", "../out", f"{self.base}/big.bin").returncode, 0)  # only --sort uses it
+        self.assertEqual(self.run_mox("config", "sort-root", "../elsewhere").returncode, 2)
+
+    def test_never_writes_over_a_file(self):
+        # The user's own big.bin, with a stale big.bin.mox beside it: once enough to write over it.
+        mine = os.path.join(self.out, "big.bin")
+        with open(mine, "w") as f:
+            f.write("mine")
+        with open(mine + ".mox", "w") as f:
+            json.dump({"version": 1, "url": "x", "total": SIZE, "segments": []}, f)
+        self.assertEqual(self.mox(f"{self.base}/big.bin").returncode, 0)
+        with open(mine) as f:
+            self.assertEqual(f.read(), "mine")
+        self.assertEqual(sha256(os.path.join(self.out, "big (1).bin")), self.digest)
+
+    def test_leaves_another_programs_part_alone(self):
+        # Firefox names its downloads in progress name.part too, with no .mox beside them.
+        theirs = os.path.join(self.out, "big.bin.part")
+        with open(theirs, "w") as f:
+            f.write("half of a firefox download")
+        self.assertEqual(self.mox(f"{self.base}/big.bin").returncode, 0)
+        with open(theirs) as f:
+            self.assertEqual(f.read(), "half of a firefox download")
+        self.assertEqual(sha256(os.path.join(self.out, "big (1).bin")), self.digest)
+
+    def test_keep_free(self):
+        mox = load_mox()
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        taken = os.path.join(self.out, "film.mkv")
+        open(taken, "w").close()
+        self.assertEqual(d._keep_free(taken), os.path.join(self.out, "film (1).mkv"))
+        self.assertEqual(d._keep_free(os.path.join(self.out, "free.mkv")), os.path.join(self.out, "free.mkv"))
 
     def test_episode_of(self):
         mox = load_mox()
@@ -799,15 +847,15 @@ class MoxTest(unittest.TestCase):
     def test_sort_then_resume(self):
         result = self.mox("--sort", "-o", "song.mp3", "-l", "2M", "--until", clock_in(2), f"{self.base}/big.bin")
         self.assertEqual(result.returncode, 3, result.stderr)
-        self.assertTrue(os.path.exists(os.path.join(self.out, "Music", "song.mp3.mox")))
+        self.assertTrue(os.path.exists(os.path.join(self.out, "mox", "Music", "song.mp3.mox")))
         result = self.run_mox("resume", self.out)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sha256(os.path.join(self.out, "Music", "song.mp3")), self.digest)
-        self.assertEqual(os.listdir(os.path.join(self.out, "Music")), ["song.mp3"])
+        self.assertEqual(sha256(os.path.join(self.out, "mox", "Music", "song.mp3")), self.digest)
+        self.assertEqual(os.listdir(os.path.join(self.out, "mox", "Music")), ["song.mp3"])
         result = self.mox("--sort", "-o", "Dark.S01E02.mkv", "-l", "2M", "--until", clock_in(2), f"{self.base}/big.bin")
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertEqual(self.run_mox("resume", self.out).returncode, 0)
-        self.assertEqual(sha256(os.path.join(self.out, "Series", "Dark", "Season 01", "Dark.S01E02.mkv")), self.digest)
+        self.assertEqual(sha256(os.path.join(self.out, "mox", "Series", "Dark", "Season 01", "Dark.S01E02.mkv")), self.digest)
 
     def test_quota(self):
         result = self.mox("--quota", "3M", "-l", "4M", f"{self.base}/big.bin")
@@ -1114,12 +1162,13 @@ class MoxTest(unittest.TestCase):
         # A plain run uses them: the saved folder, sorted.
         result = self.run_mox("-o", "clip.mp4", f"{self.base}/big.bin")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sha256(os.path.join(saved, "Videos", "clip.mp4")), self.digest)
+        self.assertEqual(sha256(os.path.join(saved, "mox", "Videos", "clip.mp4")), self.digest)
         # The command line still wins.
         self.assertEqual(self.mox(f"{self.base}/big.bin").returncode, 0)
         self.assertTrue(os.path.exists(os.path.join(self.out, "big.bin")))
         self.assertEqual(self.run_mox("config", "--unset", "sort").returncode, 0)
-        self.assertNotIn("sort = ", open(os.path.join(self.data, "mox", "config")).read())
+        with open(os.path.join(self.data, "mox", "config")) as f:
+            self.assertNotIn("sort = ", f.read())
         bad = self.run_mox("config", "jobs", "lots")
         self.assertEqual(bad.returncode, 2)
         self.assertIn("whole number", bad.stderr)
@@ -1310,6 +1359,27 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(wait_for("config")["settings"]["sort"], "on")
         send(cmd="history")
         self.assertGreaterEqual(len(wait_for("history")["entries"]), 3)
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def test_engine_takes_a_fresh_link_for_the_same_file(self):
+        proc, send, wait_for = self.start_engine("-l", "1M")
+        send(cmd="add", urls=[f"{self.base}/big.bin?md5=old&expires=1"])
+        first = wait_for("added")["ids"]
+        send(cmd="add", urls=[f"{self.base}/big.bin?md5=new&expires=2"])
+        self.assertEqual(wait_for("added")["ids"], [])  # no second row for the same file
+        self.assertIn("link was updated", wait_for("notice")["text"])
+        row = wait_for("state")["downloads"]
+        self.assertEqual([(r["id"], r["url"].split("?")[1]) for r in row], [(first[0], "md5=new&expires=2")])
+        # A failed row comes back to life with a fresh link.
+        send(cmd="add", urls=[f"{self.base}/gone/big.bin?t=1"])
+        gone = wait_for("added")["ids"][0]
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == gone)["status"], "error")
+        send(cmd="add", urls=[f"{self.base}/gone/big.bin?t=2"])
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == gone)["status"], "error")  # tried again
+        # Different files that differ only in the query stay two rows.
+        send(cmd="add", urls=[f"{self.base}/get.php?id=1", f"{self.base}/get.php?id=2"])
+        self.assertEqual(len(wait_for("added")["ids"]), 2)
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
