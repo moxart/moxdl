@@ -50,14 +50,16 @@ Some servers gain nothing or refuse extra connections. `mox bench URL` measures 
 - Ctrl+C pauses. Run the same command again, or `mox resume`, to continue, even after a reboot. A second Ctrl+C quits without waiting for slow connections to close.
 - Retries dropped connections, and uses fewer connections when the server refuses more.
 - Waits out internet outages, however long, and carries on by itself.
-- `--watch` downloads every file link you copy.
-- Pick what downloads first with the arrow keys while it runs.
+- Checks there is room on the disk before a file starts.
+- `--watch` downloads every file link you copy, and `--paste` the links on the clipboard right now, even with text around them.
+- `--page` downloads every file a folder listing links to.
+- Pick what downloads first with the arrow keys while it runs, and watch a video while it downloads.
 - Scheduled downloads, such as 2:00 to 7:00 every night, and shutting down or sleeping when they end.
 - `--sort` saves videos, music, pictures and so on in their own folders, and episodes of a series in a folder per show and season.
 - `--quota` pauses after a set amount, and the history shows how much was downloaded today and in the last 7 and 30 days.
 - A desktop notification, a Telegram message or a soft sound when the downloads are done.
 - A history of finished downloads, counted by kind: video, audio, images, documents and so on.
-- SOCKS5 and HTTP proxies, with user name and password.
+- SOCKS5 and HTTP proxies, with user name and password, or a proxy only for the servers that cannot be reached directly.
 - An expired link can be replaced with a fresh one without starting over.
 - Starts over if the file on the server has changed.
 - A total speed limit, SHA-256 verification, several files at once, URLs from a list file.
@@ -65,6 +67,15 @@ Some servers gain nothing or refuse extra connections. `mox bench URL` measures 
 - Works as a Python library: `mox.download(url)`.
 
 ## Usage
+
+The simplest way: copy the links, then run `mox` on its own. It offers the links on the clipboard, or asks you to paste them:
+
+```
+$ mox
+13 links on the clipboard (Mr.Robot.S04E01.1080p.mkv and 12 more). Download? [Y/n]
+```
+
+Or give the links on the command line:
 
 ```bash
 mox https://example.com/file.iso
@@ -100,6 +111,26 @@ Check the file against a published checksum:
 mox --sha256 9f86d081884c7d65... https://example.com/release.tar.gz
 ```
 
+### Settings
+
+Save what you would otherwise type every time, and a plain `mox` uses it:
+
+```bash
+mox config dir ~/Downloads
+mox config sort on
+mox config fallback-proxy auto
+```
+
+`mox config` lists every setting and its value. `mox config --unset sort` forgets one. Options on the command line still win over saved settings. The settings live in `~/.config/mox/config` (`%APPDATA%\mox\config` on Windows).
+
+### When something does not work
+
+```bash
+mox doctor
+```
+
+Checks this computer and says, for each thing mox uses, whether it works and what to do if not: a newer mox, free disk space, the internet, a system-wide proxy, the clipboard tool, the sound (it plays it), notifications and the keys.
+
 ### Picking up where you left off
 
 An unfinished download leaves `FILE.part` and `FILE.mox` behind. To continue everything unfinished in a folder:
@@ -120,10 +151,24 @@ With several downloads in a run, the arrow keys reorder them while they run:
 | Enter | Download it next |
 | Shift+↑ Shift+↓, or `[` `]` | Move it one place up or down |
 | `f` | Only this one, at full speed, until it is done. `f` again shares the speed again |
+| `w` | Download it from the start onward, to watch while it downloads |
+| `p` or Space | Pause just this one, or let it carry on |
+| `x` twice | Take it off the list. Its `.part` stays, to continue later |
+| `o` | Open it: a finished file, or one in watch mode in mpv or VLC |
 
 If every slot is taken (`-j`, 3 by default), the lowest download in the list pauses to make room. It keeps its progress and continues when its turn comes. Waiting downloads show their place in line.
 
+### Watching while it downloads
+
+mox normally fetches pieces from all over a file at once, so a video cannot play until it has all arrived. `--stream`, or `w` on a selected download, fills the file from the start instead. Its icon turns to ▶, and once the first 32 MB are in, the status line says how far the `.part` file can be played. Open it in mpv or VLC and watch while the rest comes in. Press `f` too for all the speed. Seeking ahead of what has arrived does not work, and some files keep their seek index at the end.
+
 ### Copy a link, get the file
+
+```bash
+mox --paste -d ~/Downloads
+```
+
+`--paste` downloads every link on the clipboard. They may sit in other text, as in a chat message, even with no space before them. `-i` reads files and pipes the same way.
 
 ```bash
 mox --watch -d ~/Downloads
@@ -198,7 +243,7 @@ export MOX_TELEGRAM_CHAT=987654321        # your chat id, e.g. from @userinfobot
 
 `MOX_TELEGRAM_API` sets a self-hosted Bot API server instead of `api.telegram.org`.
 
-`--sound` plays a short, low, quiet sound when the downloads end, if at least one finished. In `--watch` mode it plays after each file. To have it every time, set `MOX_SOUND=1`; `--no-sound` then turns it off for one run. It plays through `pw-play`, `paplay`, `aplay` or `afplay`, whichever is installed, and `winsound` on Windows.
+mox plays a short, low, quiet sound when the downloads end, if at least one finished. In `--watch` mode it plays after each file. `--no-sound` turns it off for one run, and `MOX_SOUND=0` for good. It plays through `pw-play`, `paplay`, `aplay` or `afplay`, whichever is installed, and `winsound` on Windows.
 
 ### Proxies
 
@@ -210,6 +255,23 @@ mox --proxy http://127.0.0.1:8080 https://example.com/file.iso
 
 With SOCKS5, the proxy resolves host names. Without `--proxy`, the `http_proxy` and `https_proxy` environment variables apply.
 
+To go direct and use a proxy only for the servers that cannot be reached directly:
+
+```bash
+mox --fallback-proxy auto -i links.txt
+mox --fallback-proxy socks5://127.0.0.1:1080 -i links.txt
+```
+
+`auto` looks for a SOCKS5 proxy on this computer, on the ports v2rayN, xray, Clash, NekoRay and Tor use. Direct here really means direct: the `http_proxy` variables, which proxy apps often set for the whole system, are ignored, and a server switches to the proxy after its first failed connection.
+
+### A whole folder
+
+```bash
+mox --page 'https://files.example/series/s04/' --match 1080p
+```
+
+`--page` downloads every file a web page links to, such as a server's folder listing, skipping subfolders and other pages. `--match` keeps the names that contain its text, or that match it when it has `*` or `?`. Many download sites turn their listings off, and then the page answers 403.
+
 ### Expired links
 
 If a link expires mid-download, mox prints the command to continue. Get a fresh link and pass the same file name:
@@ -217,6 +279,8 @@ If a link expires mid-download, mox prints the command to continue. Get a fresh 
 ```bash
 mox -d ~/Downloads -o big-file.iso 'https://host.example/new-signed-link'
 ```
+
+A fresh list of links for the same files needs no names: when the file name in each link is the same, every unfinished file continues where it stopped.
 
 ### From Python
 
@@ -238,6 +302,9 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `-d, --dir DIR` | current directory | Where to save files |
 | `-o, --output NAME` | from the server | File name, single URL only |
 | `-i, --input FILE` | | Read URLs from a file, `-` for stdin |
+| `-p, --paste` | | Download the links on the clipboard |
+| `--page URL` | | Download the files a page links to, repeatable |
+| `--match TEXT` | | With `--page`, only names containing `TEXT` or matching it |
 | `-c, --connections N` | 16 | Connections per file, 1 to 64 |
 | `-j, --jobs N` | 3 | Files downloaded at the same time |
 | `-l, --limit RATE` | none | Total speed limit, such as `500K` or `2M` |
@@ -246,17 +313,19 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `-H, --header 'K: V'` | | Extra request header, repeatable |
 | `--sha256 HEX` | | Verify the finished file, single URL only |
 | `-x, --proxy URL` | environment | `socks5://`, `socks5h://` or `http://` proxy |
+| `--fallback-proxy URL` | | SOCKS5 proxy only for servers unreachable directly, `auto` to find one |
 | `--at HH:MM` | | Wait until this time of day before starting |
 | `--until HH:MM` | | Pause at this time of day |
 | `-w, --watch` | | Download every file link copied to the clipboard |
 | `-s, --sort` | | Save each kind of file in its own folder |
+| `--stream` | | Fill files from the start, to watch while they download |
 | `-q, --quota SIZE` | none | Pause after this much, such as `5G` |
 | `--then ACTION` | | `shutdown` or `sleep` when the downloads end |
 | `-n, --notify` | | Desktop or Telegram notification when done |
-| `--sound` | off | A soft sound when done, `MOX_SOUND=1` for always |
+| `--no-sound` | | No sound when done, `MOX_SOUND=0` for never |
 | `--no-history` | | Leave these downloads out of `mox history` |
 
-Other commands: `mox resume [DIR]` takes the download options above, except `-s`. `mox history` takes `-l [N]`, `-k KIND` and `--clear`. `mox bench URL` takes `-s SECONDS` per round, `-c` for the most connections to try, and `-t`, `-H` and `-x`.
+Other commands: `mox resume [DIR]` takes the download options above, except `-s`. `mox history` takes `-l [N]`, `-k KIND` and `--clear`. `mox config [SETTING [VALUE]]` takes `--unset`. `mox doctor` takes nothing. `mox bench URL` takes `-s SECONDS` per round, `-c` for the most connections to try, and `-t`, `-H`, `-x` and `--fallback-proxy`.
 
 Exit codes are 0 when everything finished, 1 when any download failed, 2 for a usage error, 3 when `--until` or `--quota` stopped unfinished downloads, and 130 when you pressed Ctrl+C.
 

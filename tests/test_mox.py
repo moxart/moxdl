@@ -11,6 +11,10 @@ Server paths:
     /alt/<file>       the same file under another URL
     /short/<file>     closes every connection after 1 MB
     /stall/<file>     sends 256 KB per request, then goes silent for 15 seconds
+    /index/           an Apache-style folder listing of the files; /index/<file> serves them
+
+The SOCKS5 proxies know one name of their own, blocked.test, which they connect to 127.0.0.1.
+Directly the name does not resolve, like a server that is only reachable through a proxy.
 
 Every reply carries an ETag, and If-Range is honored, so a file replaced on disk counts as changed.
 
@@ -23,6 +27,7 @@ import datetime
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import random
 import re
@@ -40,6 +45,7 @@ import unittest
 import wave
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from queue import Empty, Queue
 from unittest import mock
 
 MOX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mox.py")
@@ -77,6 +83,9 @@ class Handler(BaseHTTPRequestHandler):
                 Handler.inflight -= 1
 
     def serve(self, busy):
+        if self.path.split("?")[0].rstrip("/") == "/index":
+            self.listing()
+            return
         parts = self.path.split("?")[0].strip("/").split("/")
         mode, name = (parts[0], parts[-1]) if len(parts) > 1 else ("", parts[-1])
         path = os.path.join(self.server.root, name)
@@ -143,6 +152,20 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(len(chunk) / rate)
 
 
+    def listing(self):
+        """What Apache shows for a folder: sort links, the parent, a subfolder, then the files."""
+        files = sorted(os.listdir(self.server.root))
+        body = ('<html><body><h1>Index of /index</h1><a href="?C=N;O=D">Name</a> <a href="?C=M;O=A">Date</a>'
+                '<a href="/">Parent Directory</a><a href="sub/">sub/</a><a href="readme.html">readme</a>'
+                + "".join(f'<a href="{urllib.parse.quote(name)}">{name}</a>' for name in files)
+                + f'<a href="{files[0]}">again</a></body></html>').encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class QuietServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         pass  # mox drops connections on purpose; the resets are expected
@@ -189,7 +212,7 @@ class Socks5Handler(socketserver.BaseRequestHandler):
         else:
             host = socket.inet_ntoa(self.recv(4))
         port = int.from_bytes(self.recv(2), "big")
-        remote = socket.create_connection((host, port))
+        remote = socket.create_connection(("127.0.0.1" if host == "blocked.test" else host, port))
         with self.server.lock:
             self.server.tunnels += 1
         with remote:
@@ -271,7 +294,11 @@ class MoxTest(unittest.TestCase):
         # Keep the history these runs write away from the real one. Subprocesses inherit this.
         self.data = self.temp_dir("mox-data-")
         for name, value in (("XDG_DATA_HOME", self.data), ("APPDATA", self.data), ("XDG_CACHE_HOME", self.data),
-                            ("MOX_NO_HISTORY", None), ("MOX_SOUND", None)):
+                            ("XDG_CONFIG_HOME", self.data),
+                            ("MOX_NO_HISTORY", None), ("MOX_SOUND", "0"),  # silent test runs
+                            # A proxy app's system-wide setting would send the tests through it.
+                            *((name, None) for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                                                        "http_proxy", "https_proxy", "all_proxy"))):
             self.addCleanup(restore_env, name, os.environ.get(name))
             if value is None:
                 os.environ.pop(name, None)
@@ -817,7 +844,11 @@ class MoxTest(unittest.TestCase):
 
     def plays(self, *args, env_extra=None):
         env, record = self.fake_player()
-        env.update(env_extra or {})
+        for name, value in (env_extra or {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = value
         result = self.run_mox("-d", self.out, *args, f"{self.base}/big.bin", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         deadline = time.monotonic() + 3  # the player runs on its own, after mox may have exited
@@ -829,11 +860,11 @@ class MoxTest(unittest.TestCase):
             return f.read().strip()
 
     def test_sound(self):
-        played = self.plays("--sound")
+        played = self.plays(env_extra={"MOX_SOUND": None})  # on unless turned off
         self.assertEqual(played, os.path.join(self.data, "mox", "done.wav"))
-        self.assertIsNone(self.plays("-o", "two.bin"))  # off unless asked for
-        self.assertIsNotNone(self.plays("-o", "three.bin", env_extra={"MOX_SOUND": "1"}))
-        self.assertIsNone(self.plays("-o", "four.bin", "--no-sound", env_extra={"MOX_SOUND": "1"}))
+        self.assertIsNone(self.plays("-o", "two.bin", "--no-sound", env_extra={"MOX_SOUND": None}))
+        self.assertIsNone(self.plays("-o", "three.bin", env_extra={"MOX_SOUND": "0"}))
+        self.assertIsNotNone(self.plays("-o", "four.bin", "--sound", env_extra={"MOX_SOUND": "0"}))
 
     def test_done_sound_is_gentle(self):
         mox = load_mox()
@@ -852,6 +883,7 @@ class MoxTest(unittest.TestCase):
         mox = load_mox()
         downloads = [FakeDownload(name) for name in "abcd"]
         queue = mox.Scheduler(downloads, 2, None, threading.Event())
+        self.addCleanup(release, queue)  # a failed assertion must not leave threads that block the exit
 
         def running():
             queue.tick()
@@ -879,7 +911,8 @@ class MoxTest(unittest.TestCase):
     def test_key_names(self):
         mox = load_mox()
         self.assertEqual(mox.Keyboard.names("\x1b[A\x1b[B\x1bOA\r"), ["up", "down", "up", "enter"])
-        self.assertEqual(mox.Keyboard.names("\x1b[1;2A]f\x1b[Cx"), ["move up", "move down", "focus"])
+        self.assertEqual(mox.Keyboard.names("\x1b[1;2A]f\x1b[Cz"), ["move up", "move down", "focus"])
+        self.assertEqual(mox.Keyboard.names("p xo"), ["pause", "pause", "remove", "open"])
 
     def test_display_marks_the_selected_row(self):
         mox = load_mox()
@@ -924,6 +957,365 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(names, ["big (1).bin", "big (2).bin", "big.bin"])  # nothing started over
         for name in names:
             self.assertEqual(sha256(os.path.join(self.out, name)), self.digest)
+
+    # -- disk space
+
+    def test_not_enough_disk_space(self):
+        mox = load_mox()
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.total, d.path = 10 * 1024 ** 3, os.path.join(self.out, "big.bin")
+        with mock.patch("shutil.disk_usage", return_value=shutil._ntuple_diskusage(0, 0, 3 * 1024 ** 3)):
+            with self.assertRaises(mox.FatalError) as caught:
+                d._check_space()
+        self.assertIn("not enough disk space: needs 10.0 GB, 3.0 GB free", str(caught.exception))
+        # What the downloads under way still need counts too.
+        d.total = 2 * 1024 ** 3
+        other = mox.Download(f"{self.base}/alt/big.bin", argparse_namespace(self.out))
+        other.total, other.path, other.device = 2 * 1024 ** 3, os.path.join(self.out, "other.bin"), os.stat(self.out).st_dev
+        mox._writing.add(other)
+        with mock.patch("shutil.disk_usage", return_value=shutil._ntuple_diskusage(0, 0, 3 * 1024 ** 3)):
+            with self.assertRaises(mox.FatalError) as caught:
+                d._check_space()
+        self.assertIn("2.0 GB for the downloads under way", str(caught.exception))
+
+    def test_disk_full_is_not_retried(self):
+        mox = load_mox()
+        full = OSError(28, "No space left on device")
+        with mock.patch.object(mox, "write_at", side_effect=full):
+            started = time.monotonic()
+            with self.assertRaises(mox.DownloadError) as caught:
+                mox.download(f"{self.base}/big.bin", self.out, retries=10)
+        self.assertIn("No space left on device", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 5)  # not ten rounds of backoff per connection
+
+    # -- --paste, links among text
+
+    def test_links_copied_from_html(self):
+        mox = load_mox()
+        copied = "https://dl.example/a.mkv?md5=VdGX&amp;expires=1792876194"
+        self.assertEqual(mox.urls_in(f"see {copied}."), ["https://dl.example/a.mkv?md5=VdGX&expires=1792876194"])
+        self.assertEqual(mox.parse_args(["-d", self.out, copied]).urls, ["https://dl.example/a.mkv?md5=VdGX&expires=1792876194"])
+        self.assertEqual(mox.urls_in("https://dl.example/a b"), ["https://dl.example/a"])  # nothing else changes
+
+    def test_paste_and_links_among_text(self):
+        clipboard = os.path.join(self.temp_dir("mox-clipboard-"), "clipboard")
+        with open(clipboard, "w") as f:
+            f.write(f"what do you suggest for these?{self.base}/big.bin and ({self.base}/empty.bin).\n")
+        env = {**os.environ, "MOX_CLIPBOARD_COMMAND": f"cat {clipboard}"}
+        result = self.run_mox("-d", self.out, "--paste", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertDownloaded()
+        self.assertTrue(os.path.exists(os.path.join(self.out, "empty.bin")))
+        # -i takes the same text, as from a file of links copied out of a chat.
+        listing = os.path.join(self.temp_dir("mox-list-"), "links.txt")
+        shutil.copy(clipboard, listing)
+        out = self.temp_dir("mox-out2-")
+        self.assertEqual(self.run_mox("-d", out, "-i", listing).returncode, 0)
+        self.assertEqual(sorted(os.listdir(out)), ["big.bin", "empty.bin"])
+        with open(clipboard, "w") as f:
+            f.write("no links here")
+        result = self.run_mox("-d", self.out, "--paste", env=env)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("no links on the clipboard", result.stderr)
+
+    # -- --page
+
+    def test_page(self):
+        result = self.mox("--page", f"{self.base}/index/")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Files only, once each: other tests add files to the server's folder, so compare with it.
+        self.assertEqual(sorted(os.listdir(self.out)), sorted(os.listdir(self.root)))
+        out = self.temp_dir("mox-out2-")
+        result = self.run_mox("-d", out, "--page", f"{self.base}/index/", "--match", "BIG*")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(out), ["big.bin"])
+        result = self.mox("--page", f"{self.base}/index/", "--match", "S09E01")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("links to no files matching 'S09E01'", result.stderr)
+        self.assertEqual(self.mox("--match", "x", f"{self.base}/big.bin").returncode, 2)
+
+    # -- --fallback-proxy
+
+    def test_fallback_proxy(self):
+        socks = f"socks5://127.0.0.1:{self.socks.server_address[1]}"
+        before = self.socks.tunnels
+        result = self.mox("--fallback-proxy", socks, f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.socks.tunnels, before)  # reachable directly, so it went direct
+        port = self.server.server_address[1]
+        result = self.mox("--fallback-proxy", socks, "-o", "blocked.bin", f"http://blocked.test:{port}/big.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertGreater(self.socks.tunnels, before)
+        self.assertEqual(sha256(os.path.join(self.out, "blocked.bin")), self.digest)
+        self.assertEqual(self.mox("--fallback-proxy", "http://127.0.0.1:1", f"{self.base}/big.bin").returncode, 2)
+
+    def test_find_local_proxy(self):
+        mox = load_mox()
+        port = self.socks.server_address[1]
+        self.assertEqual(mox.find_local_proxy([closed_port(), port]), f"socks5h://127.0.0.1:{port}")
+        self.assertIsNone(mox.find_local_proxy([closed_port(), self.server.server_address[1]]))  # HTTP is not SOCKS
+
+    # -- --stream
+
+    def test_in_order(self):
+        mox = load_mox()
+        mb = 1024 * 1024
+        pieces = mox.in_order([{"start": 10 * mb, "end": 20 * mb - 1, "done": 3 * mb},
+                               {"start": 0, "end": 10 * mb - 1, "done": 0}])
+        self.assertEqual([(p["start"] // mb, (p["end"] + 1) // mb, p["done"] // mb) for p in pieces],
+                         [(0, 4, 0), (4, 8, 0), (8, 10, 0), (10, 13, 3), (13, 17, 0), (17, 20, 0)])
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.ranges, d.segments = True, pieces
+        claimed = [d._next_segment()["start"] // mb for _ in range(3)]
+        self.assertEqual(claimed, [0, 4, 8])  # from the start, in order
+
+    def test_stream(self):
+        result = self.mox("--stream", "-c", "4", f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertDownloaded()
+
+    # -- fresh links for a whole list
+
+    def test_fresh_links_resume_a_list(self):
+        listing = os.path.join(self.temp_dir("mox-list-"), "links.txt")
+        with open(listing, "w") as f:
+            f.write(f"{self.base}/big.bin?md5=old&expires=1\n")
+        result = self.mox("--sort", "-i", listing, "-l", "2M", "--until", clock_in(2))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        with open(listing, "w") as f:  # the site's new links: another token, the same files
+            f.write(f"{self.base}/alt/big.bin?md5=new&expires=2\n")
+        result = self.mox("--sort", "-i", listing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("resumed", result.stderr)
+        self.assertDownloaded()  # big.bin, not big (1).bin started over
+
+    # -- mox config
+
+    def test_config(self):
+        saved = self.temp_dir("mox-saved-")
+        self.assertEqual(self.run_mox("config", "dir", saved).returncode, 0)
+        self.assertEqual(self.run_mox("config", "sort", "on").returncode, 0)
+        self.assertEqual(self.run_mox("config", "limit", "50M").returncode, 0)
+        listing = self.run_mox("config").stdout
+        self.assertRegex(listing, r"dir\s+" + re.escape(saved))
+        self.assertRegex(listing, r"sort\s+on")
+        self.assertEqual(self.run_mox("config", "sort").stdout.strip(), "on")
+        # A plain run uses them: the saved folder, sorted.
+        result = self.run_mox("-o", "clip.mp4", f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sha256(os.path.join(saved, "Videos", "clip.mp4")), self.digest)
+        # The command line still wins.
+        self.assertEqual(self.mox(f"{self.base}/big.bin").returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "big.bin")))
+        self.assertEqual(self.run_mox("config", "--unset", "sort").returncode, 0)
+        self.assertNotIn("sort = ", open(os.path.join(self.data, "mox", "config")).read())
+        bad = self.run_mox("config", "jobs", "lots")
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("whole number", bad.stderr)
+        self.assertEqual(self.run_mox("config", "colour", "red").returncode, 2)
+        # A bad line written by hand is reported and skipped, never fatal.
+        with open(os.path.join(self.data, "mox", "config"), "a") as f:
+            f.write("jobs = many\n")
+        result = self.mox(f"{self.base}/alt/big.bin", "-o", "again.bin")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ignoring the setting jobs = many", result.stderr)
+
+    # -- a plain 'mox'
+
+    def run_on_terminal(self, args, typed, env=None, timeout=60):
+        """Run mox on a pseudo-terminal, type `typed` (a list of (seconds to wait, bytes)), return (code, output)."""
+        master, slave = os.openpty()
+        launcher = ("import fcntl, os, sys, termios; fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+                    "os.execv(sys.executable, [sys.executable] + sys.argv[1:])")
+        proc = subprocess.Popen([sys.executable, "-c", launcher, MOX, *args], stdin=slave, stdout=slave,
+                                stderr=slave, start_new_session=True, env=env)
+        os.close(slave)
+        self.addCleanup(os.close, master)
+        output = []
+        threading.Thread(target=drain, args=(master, output), daemon=True).start()
+        for wait, text in typed:
+            time.sleep(wait)
+            os.write(master, text)
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            code = None
+        time.sleep(0.2)
+        return code, b"".join(output).decode(errors="replace")
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "needs a pseudo-terminal")
+    def test_plain_mox_offers_the_clipboard(self):
+        clipboard = os.path.join(self.temp_dir("mox-clipboard-"), "clipboard")
+        with open(clipboard, "w") as f:
+            f.write(f"here: {self.base}/big.bin")
+        env = {**os.environ, "MOX_CLIPBOARD_COMMAND": f"cat {clipboard}"}
+        code, output = self.run_on_terminal(["-d", self.out], [(1.5, b"\n")], env)
+        self.assertEqual(code, 0, output)
+        self.assertIn("1 link on the clipboard (big.bin). Download? [Y/n]", output)
+        self.assertDownloaded()
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "needs a pseudo-terminal")
+    def test_plain_mox_takes_pasted_links(self):
+        env = {**os.environ, "MOX_CLIPBOARD_COMMAND": "true"}  # an empty clipboard
+        code, output = self.run_on_terminal(["-d", self.out], [(1.5, f"{self.base}/big.bin\n\n".encode())], env)
+        self.assertEqual(code, 0, output)
+        self.assertIn("Paste the links", output)
+        self.assertDownloaded()
+
+    def test_plain_mox_in_a_script(self):
+        result = self.run_mox("-d", self.out)  # no terminal: an error, not a question nobody answers
+        self.assertEqual(result.returncode, 2)
+
+    # -- p, x and o
+
+    def test_pause_and_remove_one(self):
+        mox = load_mox()
+        downloads = [FakeDownload(name) for name in "abc"]
+        queue = mox.Scheduler(downloads, 2, None, threading.Event())
+        self.addCleanup(release, queue)  # a failed assertion must not leave threads that block the exit
+
+        def running():
+            queue.tick()
+            time.sleep(0.05)
+            queue.tick()
+            return sorted(d.name for d, _, _ in queue.running.values())
+
+        self.assertEqual(running(), ["a", "b"])
+        queue.toggle_hold(downloads[0])  # a waits, c takes its place
+        self.assertEqual(running(), ["b", "c"])
+        self.assertTrue(downloads[0].held)
+        queue.toggle_hold(downloads[0])  # a is first in the list again, so it runs, and c makes room
+        self.assertEqual(running(), ["a", "b"])
+        queue.remove(downloads[1])
+        self.assertEqual(running(), ["a", "c"])
+        self.assertEqual([d.name for d in downloads], ["a", "c"])
+        queue.stop.set()
+        while not queue.finished():
+            queue.tick()
+            time.sleep(0.05)
+
+    def test_remove_needs_two_presses(self):
+        mox = load_mox()
+        downloads = [FakeDownload(name) for name in "ab"]
+        queue = mox.Scheduler(downloads, 2, None, threading.Event())
+        display = mox.Display(downloads, stream=io.StringIO(), queue=queue)
+        display.selected = 1
+        mox.handle_keys(["remove"], display, queue)
+        self.assertEqual(len(downloads), 2)
+        mox.handle_keys(["up", "remove", "down", "remove"], display, queue)  # moving away cancels it
+        self.assertEqual(len(downloads), 2)
+        mox.handle_keys(["remove", "remove"], display, queue)
+        self.assertEqual([d.name for d in downloads], ["a"])
+        self.assertEqual(display.selected, 0)
+
+    def test_open_command(self):
+        mox = load_mox()
+        tools = self.temp_dir("mox-tools-")
+        for tool in ("vlc", "xdg-open"):
+            with open(os.path.join(tools, tool), "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(os.path.join(tools, tool), 0o755)
+        with mock.patch.dict(os.environ, {"PATH": tools}), mock.patch.object(mox.sys, "platform", "linux"):
+            self.assertEqual(mox.open_command("/x/a.mkv.part", True)[0], "vlc")  # a .part takes a player
+            self.assertEqual(mox.open_command("/x/a.mkv", False), ["xdg-open", "/x/a.mkv"])
+        with mock.patch.dict(os.environ, {"PATH": self.temp_dir("mox-empty-")}):
+            self.assertIsNone(mox.open_command("/x/a.mkv.part", True))
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.status = "downloading"
+        self.assertIn("press w", mox.open_download(d))
+
+    # -- mox doctor
+
+    def test_doctor(self):
+        result = self.run_mox("doctor", timeout=90)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for expected in ("mox ", "free in", "sound", "history"):
+            self.assertIn(expected, result.stdout)
+        self.assertIn("the sound when downloads finish is off", result.stdout)  # MOX_SOUND=0 in the tests
+        self.assertRegex(result.stdout, r"\n(All good\.|\d+ things? to fix, above\.)\n$")
+
+    # -- mox engine (the desktop app's link to mox)
+
+    def start_engine(self, *args):
+        proc = subprocess.Popen([sys.executable, MOX, "engine", "-d", self.out, *args], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: [proc.poll() is None and proc.kill(), proc.wait(),
+                                 *(pipe.close() for pipe in (proc.stdin, proc.stdout, proc.stderr))])
+        events = Queue()
+        threading.Thread(target=lambda: [events.put(json.loads(line)) for line in proc.stdout] and None,
+                         daemon=True).start()
+
+        def send(**command):
+            proc.stdin.write(json.dumps(command) + "\n")
+            proc.stdin.flush()
+
+        def wait_for(kind, test=lambda e: True, timeout=30):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                try:
+                    event = events.get(timeout=0.5)
+                except Empty:
+                    continue
+                if event["type"] == kind and test(event):
+                    return event
+            self.fail(f"no {kind} event")
+
+        return proc, send, wait_for
+
+    def test_engine(self):
+        proc, send, wait_for = self.start_engine("-c", "4")
+        self.assertEqual(wait_for("hello")["version"], load_mox().VERSION)
+        send(cmd="add", urls=[f"{self.base}/big.bin"])
+        first = wait_for("added")["ids"][0]
+        done = wait_for("finished", lambda e: e["id"] == first)
+        self.assertEqual(done["status"], "done")
+        self.assertDownloaded()
+        state = wait_for("state")
+        row = state["downloads"][0]
+        self.assertEqual((row["id"], row["status"], row["done"], row["total"]), (first, "done", SIZE, SIZE))
+        self.assertEqual(len(row["pieces"]), 120)
+
+        # Queue control: one at a time, the second link moved ahead of the first.
+        send(cmd="set", jobs=1, limit="2M")
+        send(cmd="add", urls=[f"{self.base}/alt/big.bin", f"{self.base}/short/big.bin"], dir=self.temp_dir("mox-e-"))
+        a, b = wait_for("added")["ids"]
+        send(cmd="hold", id=a, on=True)
+        held = wait_for("state", lambda e: any(d["id"] == a and d["status"] == "held" for d in e["downloads"]))
+        self.assertEqual(held["jobs"], 1)
+        send(cmd="set", limit=None)
+        finished = wait_for("finished", lambda e: e["id"] == b)
+        self.assertEqual(finished["status"], "done", finished["message"])  # b went first
+        send(cmd="hold", id=a, on=False)
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == a)["status"], "done")
+
+        send(cmd="add", text=f"two links:{self.base}/empty.bin\n# a comment\nand {self.base}/empty.bin again")
+        self.assertEqual(len(wait_for("added")["ids"]), 1)  # found in the text, and only once
+        send(cmd="nonsense")
+        self.assertIn("unknown command", wait_for("error")["text"])
+        send(cmd="config_set", key="sort", value="sideways")
+        self.assertIn("on or off", wait_for("error")["text"])
+        send(cmd="config_set", key="sort", value="on")
+        self.assertEqual(wait_for("config")["settings"]["sort"], "on")
+        send(cmd="history")
+        self.assertGreaterEqual(len(wait_for("history")["entries"]), 3)
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def test_engine_saves_progress_on_quit(self):
+        proc, send, wait_for = self.start_engine("-l", "2M")
+        send(cmd="add", urls=[f"{self.base}/big.bin"])
+        first = wait_for("added")["ids"][0]
+        wait_for("state", lambda e: e["downloads"][0]["done"] > 0)
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+        self.assertTrue(os.path.exists(os.path.join(self.out, "big.bin.mox")))  # resumable
+        proc, send, wait_for = self.start_engine()
+        send(cmd="add", urls=[f"{self.base}/big.bin"])
+        self.assertEqual(wait_for("finished")["status"], "done")
+        self.assertDownloaded()
+        proc.stdin.close()  # the app went away: the engine exits by itself
+        self.assertEqual(proc.wait(timeout=20), 0)
 
     # -- mox history
 
@@ -998,6 +1390,7 @@ class FakeDownload:
 
     def __init__(self, name):
         self.name, self.status, self.path = name, "waiting", None
+        self.held = self.removed = False
 
     def run(self, stop, limiter):
         self.status = "downloading"
@@ -1005,7 +1398,16 @@ class FakeDownload:
         self.status = "paused"
 
     def requeue(self):
-        return FakeDownload(self.name)
+        fresh = FakeDownload(self.name)
+        fresh.held = self.held
+        return fresh
+
+
+def release(queue):
+    """Stop every thread a scheduler test started."""
+    queue.stop.set()
+    for _, _, halt in list(queue.running.values()):
+        halt.set()
 
 
 def drain(fd, into):

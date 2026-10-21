@@ -8,10 +8,14 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fnmatch
 import functools
 import hashlib
+import html
+import html.parser
 import http.client
 import io
+import itertools
 import json
 import math
 import mimetypes
@@ -33,11 +37,14 @@ import urllib.parse
 import urllib.request
 import wave
 from collections import deque
+from queue import Empty, Queue
 
 VERSION = "1.6"
 CHUNK = 256 * 1024
 MIN_SPLIT = 256 * 1024  # smallest piece when first dividing a file between connections
 MIN_STEAL = 64 * 1024   # smallest piece an idle connection takes over from a busy one
+STREAM_PIECE = 4 * 1024 * 1024  # --stream cuts files into pieces this big, taken in order from the start
+STREAM_PLAYABLE = 32 * 1024 * 1024  # a streamed file is worth opening in a player once this much is in order
 MIN_STEAL_ETA = 1.0     # seconds: only take over work from a piece that would take longer than this
 IDLE_POLL = 0.2         # seconds an idle connection waits before looking for work again
 MIN_ACTIVE = 2         # a busy server never makes a download drop below this many connections
@@ -179,6 +186,14 @@ class Proxy:
 
 _proxy: Proxy | None = None
 _opener = urllib.request.build_opener()  # honours http_proxy / https_proxy from the environment
+# --fallback-proxy: servers that cannot be reached directly go through it, the rest go direct.
+_fallback: Proxy | None = None
+_fallback_opener = None
+_proxied_hosts: set[str] = set()
+_proxied_lock = threading.Lock()
+# Where local proxy apps listen for SOCKS5 by default, for --fallback-proxy auto: v2rayN and
+# xray, the usual SOCKS port, NekoRay, Clash (mixed and SOCKS), Tor.
+LOCAL_PROXY_PORTS = (10808, 1080, 2080, 7890, 7891, 9050)
 
 SOCKS_ERRORS = {
     1: "general failure", 2: "connection not allowed by ruleset", 3: "network unreachable",
@@ -275,10 +290,69 @@ def configure_proxy(url: str | None) -> None:
         _opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": url, "https": url}))
 
 
+def configure_fallback(url: str | None) -> None:
+    global _fallback, _fallback_opener, _opener
+    _proxied_hosts.clear()
+    if not url:
+        _fallback = _fallback_opener = None
+        return
+    # Direct means direct: with HTTP_PROXY set, as proxy apps do system-wide, the "direct" try
+    # went through that proxy too, and a server it could not reach never got the fallback.
+    _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    _fallback = Proxy(url)
+    _fallback_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                                   _SocksHTTPHandler(_fallback), _SocksHTTPSHandler(_fallback))
+
+
+def find_local_proxy(ports=LOCAL_PROXY_PORTS) -> str | None:
+    """A SOCKS5 proxy listening on this machine, such as v2rayN's or Clash's."""
+    for port in ports:
+        try:
+            with socket.create_connection(("127.0.0.1", port), 0.5) as sock:
+                sock.settimeout(0.5)
+                sock.sendall(b"\x05\x01\x00")  # SOCKS5, offering no login: a SOCKS5 proxy answers 05 00
+                if sock.recv(2) == b"\x05\x00":
+                    return f"socks5h://127.0.0.1:{port}"
+        except OSError:
+            continue
+    return None
+
+
+def configure_network(args) -> None:
+    """--proxy and --fallback-proxy, with 'auto' looked up on this machine."""
+    configure_proxy(args.proxy)
+    url = args.fallback_proxy
+    if url == "auto":
+        url = find_local_proxy()
+        if url:
+            print(f"Servers that cannot be reached directly will go through {url}.", file=sys.stderr)
+        else:
+            print("! --fallback-proxy auto: found no SOCKS5 proxy on this machine "
+                  f"(ports {', '.join(map(str, LOCAL_PROXY_PORTS))}), so everything goes direct.", file=sys.stderr)
+    configure_fallback(url)
+
+
+def host_of(url: str) -> str:
+    return urllib.parse.urlsplit(url).hostname or ""
+
+
+def proxied(url: str) -> bool:
+    return _fallback is not None and host_of(url) in _proxied_hosts
+
+
+def use_fallback(url: str) -> bool:
+    """Send this server through --fallback-proxy from now on. False when there is none, or it already is."""
+    with _proxied_lock:
+        if _fallback is None or host_of(url) in _proxied_hosts:
+            return False
+        _proxied_hosts.add(host_of(url))
+        return True
+
+
 def request(url, headers, timeout, start=None, end=None):
     req = urllib.request.Request(url, headers=build_headers(headers, start, end))
     try:
-        return _opener.open(req, timeout=timeout)
+        return (_fallback_opener if proxied(url) else _opener).open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code in RETRYABLE_HTTP:
             raise
@@ -288,6 +362,8 @@ def request(url, headers, timeout, start=None, end=None):
 
 def keep_alive_possible(url: str) -> bool:
     """Our own persistent connections work directly or through SOCKS, but not through an HTTP proxy."""
+    if _fallback is not None:
+        return True  # direct, or through --fallback-proxy, which is always SOCKS5
     if _proxy:
         return _proxy.socks
     parts = urllib.parse.urlsplit(url)
@@ -299,6 +375,7 @@ class KeepAlive:
     """One worker's persistent connection, so each new piece skips the TCP and TLS handshakes."""
 
     def __init__(self, url: str, timeout: float):
+        self.url = url
         parts = urllib.parse.urlsplit(url)
         self.https = parts.scheme == "https"
         self.host, self.port = parts.hostname, parts.port
@@ -307,11 +384,13 @@ class KeepAlive:
         self.conn: http.client.HTTPConnection | None = None
 
     def _connect(self) -> http.client.HTTPConnection:
-        extra = {"proxy": _proxy} if _proxy else {}
+        # Looked up at every connect: a server can move to --fallback-proxy mid-download.
+        proxy = _fallback if proxied(self.url) else _proxy
+        extra = {"proxy": proxy} if proxy else {}
         if self.https:
-            cls = SocksHTTPSConnection if _proxy else http.client.HTTPSConnection
+            cls = SocksHTTPSConnection if proxy else http.client.HTTPSConnection
             return cls(self.host, self.port, timeout=self.timeout, context=ssl.create_default_context(), **extra)
-        cls = SocksHTTPConnection if _proxy else http.client.HTTPConnection
+        cls = SocksHTTPConnection if proxy else http.client.HTTPConnection
         return cls(self.host, self.port, timeout=self.timeout, **extra)
 
     def get(self, headers: dict) -> http.client.HTTPResponse:
@@ -348,10 +427,10 @@ def online_checks() -> list[tuple[str, int]]:
     return checks
 
 
-def can_connect(host: str, port: int) -> bool:
+def can_connect(host: str, port: int, proxy: Proxy | None) -> bool:
     try:
-        if _proxy and _proxy.socks:
-            sock = socks5_connect(_proxy, host, port, ONLINE_CHECK_TIMEOUT)
+        if proxy and proxy.socks:
+            sock = socks5_connect(proxy, host, port, ONLINE_CHECK_TIMEOUT)
         else:
             sock = socket.create_connection((host, port), ONLINE_CHECK_TIMEOUT)
     except FatalError:  # the proxy turned down our login: a problem, but the internet is there
@@ -375,11 +454,12 @@ def internet_down(url: str) -> bool:
     """
     parts = urllib.parse.urlsplit(url)
     server = (parts.hostname or "", parts.port or (443 if parts.scheme == "https" else 80))
-    targets = [(_proxy.host, _proxy.port)] if _proxy and not _proxy.socks else [server] + online_checks()
+    proxy = _fallback if proxied(url) else _proxy
+    targets = [(proxy.host, proxy.port)] if proxy and not proxy.socks else [server] + online_checks()
     with _online_lock:
         checked, online = _online_cache.get(server, (None, True))
         if checked is None or time.monotonic() - checked >= ONLINE_CHECK_SHARED:
-            online = any(can_connect(host, port) for host, port in targets)
+            online = any(can_connect(host, port, proxy) for host, port in targets)
             _online_cache[server] = (time.monotonic(), online)
     return not online
 
@@ -459,6 +539,8 @@ else:  # Windows
 
 _claimed_paths: set[str] = set()  # paths taken by downloads in this run
 _claim_lock = threading.Lock()
+_download_keys = itertools.count(1)
+_writing: set = set()  # downloads under way, whose files will still grow; see Download._check_space
 
 
 class RateLimiter:
@@ -472,13 +554,23 @@ class RateLimiter:
         self.lock = threading.Lock()
         self.used = 0  # bytes received by every download, for --quota and the traffic in the history
 
+    def set_rate(self, rate: int | None) -> None:
+        """Change the limit while downloads run, as the desktop app does."""
+        with self.lock:
+            self.rate = rate
+            self.capacity = max((rate or 0) // 4, CHUNK)
+            self.tokens = min(self.tokens, float(self.capacity))
+            self.last = time.monotonic()
+
     def consume(self, n: int) -> None:
         with self.lock:
             self.used += n
-        if not self.rate:
-            return
         while True:
             with self.lock:
+                # Read under the lock on every pass: the limit can change, or go, while a
+                # connection waits here, and a None read halfway through crashed it.
+                if not self.rate:
+                    return
                 now = time.monotonic()
                 self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
                 self.last = now
@@ -486,7 +578,7 @@ class RateLimiter:
                     self.tokens -= n
                     return
                 wait = (n - self.tokens) / self.rate
-            time.sleep(wait)
+            time.sleep(min(wait, 0.5))  # wake now and then, so a raised or removed limit applies soon
 
 
 # ---------------------------------------------------------------- kinds of files
@@ -563,10 +655,27 @@ def folder_named(parent: str, name: str) -> str:
     return name
 
 
+def in_order(segments: list[dict]) -> list[dict]:
+    """The same work in STREAM_PIECE pieces sorted by position, for --stream. Idle connections
+    take the first unclaimed piece in the list, so the file fills from the start and a player
+    can open the .part while the rest arrives. What is already done stays as it is."""
+    pieces = []
+    for seg in sorted(segments, key=lambda s: s["start"]):
+        if seg["done"]:
+            pieces.append({"start": seg["start"], "end": seg["start"] + seg["done"] - 1, "done": seg["done"]})
+        pos = seg["start"] + seg["done"]
+        while pos <= seg["end"]:
+            end = min(seg["end"], pos + STREAM_PIECE - 1)
+            pieces.append({"start": pos, "end": end, "done": 0})
+            pos = end + 1
+    return pieces
+
+
 # ---------------------------------------------------------------- download
 
 class Download:
     def __init__(self, url: str, opts, name: str | None = None, sha256: str | None = None):
+        self.key = next(_download_keys)  # names it to `mox engine` clients, across restarts
         self.url = self.final_url = url
         self.opts = opts
         self.custom_name = name
@@ -581,6 +690,10 @@ class Download:
         self.validator: str | None = None
         self.content_type = ""
         self.kind = "other"
+        self.stream = getattr(opts, "stream", False)  # fill the file from the start, to watch while it downloads
+        self.held = False  # paused with the p key: it waits until p again
+        self.removed = False  # taken off the list with the x key while it ran
+        self.device: int | None = None  # the disk it is written to, for _check_space
         self.dir = opts.dir  # --dir, or the folder --sort picks for this kind of file
         self.active = 0
         self.path: str | None = None
@@ -596,7 +709,9 @@ class Download:
     def restart(self) -> Download:
         """A fresh copy that picks up from the saved state file, for the next scheduled session."""
         fresh = Download(self.url, self.opts, self.custom_name, self.sha256)
+        fresh.key = self.key
         fresh.dir = self.dir  # mox resume finds some in --sort folders, which its options do not name
+        fresh.stream, fresh.held = self.stream, self.held  # the w and p keys
         return fresh
 
     def requeue(self) -> Download:
@@ -616,11 +731,25 @@ class Download:
             self.status, self.message, self.error_status = "error", str(e), e.status
         except Exception as e:  # keep one broken download from killing the rest
             self.status, self.message = "error", f"{type(e).__name__}: {e}"
+        finally:
+            with _claim_lock:
+                _writing.discard(self)
 
     def pieces(self) -> list[tuple[int, int]]:
         """(start, bytes done) for every piece, for drawing the map."""
         with self.lock:
             return [(s["start"], s["done"]) for s in self.segments]
+
+    def ready(self) -> int:
+        """Bytes on disk from the very start of the file, with no gap: what a player can play."""
+        with self.lock:
+            pieces = sorted((s["start"], s["done"]) for s in self.segments)
+        ready = 0
+        for start, done in pieces:
+            if start > ready:
+                break
+            ready = max(ready, start + done)
+        return ready
 
     def speed(self) -> float:
         now = time.monotonic()
@@ -650,8 +779,11 @@ class Download:
             return
 
         state_path, part_path = self.path + STATE_SUFFIX, self.path + PART_SUFFIX
+        self._check_space()
         resumed = self._load_state(state_path, part_path)
         self.segments = resumed or self._plan()
+        if self.stream and self.ranges and self.total:
+            self.segments = in_order(self.segments)
         self.done = sum(s["done"] for s in self.segments)
         if resumed:
             self.message = f"resumed at {human_size(self.done)}"
@@ -710,13 +842,41 @@ class Download:
             return os.path.join(self.opts.dir, SORT_FOLDERS[self.kind])
         return self.opts.dir
 
+    def _space_needed(self) -> int:
+        """Bytes this file still has to take on disk. The .part is sparse, so its blocks fill in
+        as data arrives; on a filesystem without sparse files they are all there already."""
+        try:
+            used = os.stat(self.path + PART_SUFFIX).st_blocks * 512
+        except (OSError, AttributeError):  # no .part yet, or Windows, which has no st_blocks
+            used = self.done
+        return max(0, (self.total or 0) - used)
+
+    def _check_space(self) -> None:
+        """Refuse to start a file that cannot fit, counting what the downloads under way still need.
+
+        Without this a full disk showed only once writes failed, part way into several files.
+        """
+        if not self.total:
+            return
+        with _claim_lock:
+            device = os.stat(self.dir).st_dev
+            others = sum(d._space_needed() for d in _writing if d.path and d.device == device)
+            free = shutil.disk_usage(self.dir).free
+            needed = self._space_needed()
+            if needed + others > free:
+                busy = f" and {human_size(others)} for the downloads under way" if others else ""
+                raise FatalError(f"not enough disk space: needs {human_size(needed)}{busy}, "
+                                 f"{human_size(free)} free")
+            self.device = device
+            _writing.add(self)
+
     def _probe(self, stop):
         attempts = 0
         while not stop.is_set():
             try:
                 return probe(self.url, self.opts.headers, self.opts.timeout)
             except RETRYABLE_ERRORS as e:
-                if self._wait_while_offline(e, stop):
+                if self._try_fallback(e, self.url) or self._wait_while_offline(e, stop):
                     attempts = 0
                     continue
                 attempts += 1
@@ -966,7 +1126,10 @@ class Download:
                         if not data:
                             finished = True
                             break
-                        write_at(fd, data, pos)
+                        try:
+                            write_at(fd, data, pos)
+                        except OSError as e:  # a full disk: retrying the network cannot fix it
+                            raise FatalError(f"cannot write the file: {e.strerror or e}") from None
                         if not received and self.message.startswith("retry"):
                             self.message = ""
                         pos += len(data)
@@ -1004,7 +1167,7 @@ class Download:
                     link.close()
                 if self._server_busy(e) and self.active > MIN_ACTIVE:
                     raise Retire from None
-                offline = self._wait_while_offline(e, stop)
+                offline = self._try_fallback(e, self.final_url) or self._wait_while_offline(e, stop)
                 attempts = 0 if offline else 1 if received else attempts + 1
                 if attempts > self.opts.retries:
                     raise FatalError(f"gave up after {self.opts.retries} retries: {reason(e)}") from None
@@ -1015,6 +1178,13 @@ class Download:
                 if not offline:
                     self.message = f"retry {attempts}: {reason(e)}"
                     stop.wait(min(2**attempts, 30))
+
+    def _try_fallback(self, e: BaseException, url: str) -> bool:
+        """A server that cannot be reached directly gets one go through --fallback-proxy. True if it got it."""
+        if isinstance(e, (ServerBusy, urllib.error.HTTPError)) or not use_fallback(url):
+            return False  # it answered, so the route works; or there is no proxy to try
+        self.message = "no direct route, going through the proxy"
+        return True
 
     def _wait_while_offline(self, e: BaseException, stop) -> bool:
         """If the internet is down, wait for it to come back without spending retries. True if it was down.
@@ -1122,6 +1292,8 @@ class Display:
         self.watching = watching
         self.queue = queue  # the Scheduler, for the focus
         self.selected: int | None = None  # the row the keys act on; None without a keyboard
+        self.removing: Download | None = None  # x was pressed once on it; x again removes it
+        self.notice, self.notice_until = "", 0.0
         self.stopping = False  # Ctrl+C was pressed and the workers are winding down
         self.drawn: list[int] = []  # screen width of each row of the last frame
         self.reported: dict[int, str] = {}
@@ -1156,6 +1328,10 @@ class Display:
         self.stream.write("".join(out))
         self.stream.flush()
 
+    def say(self, text: str) -> None:
+        """A short message in the status line, for a few seconds: what a key just did."""
+        self.notice, self.notice_until = text, time.monotonic() + 4
+
     def close(self) -> None:
         if self.tty:
             self.stream.write("\x1b[?25h")
@@ -1172,7 +1348,7 @@ class Display:
 
     def _place(self, d: Download) -> int:
         """1 for the download that starts next, 2 after it, and so on."""
-        waiting = [x for x in self.downloads if x.status == "waiting"]
+        waiting = [x for x in self.downloads if x.status == "waiting" and not x.held]
         return next(i for i, x in enumerate(waiting, 1) if x is d)
 
     @staticmethod
@@ -1197,6 +1373,10 @@ class Display:
         """One line per download: name, a bar that doubles as the piece map, then the numbers."""
         name_width, bar_width, count = layout
         icon, color = STYLE[d.status]
+        if d.stream and d.status == "downloading":
+            icon = "▶"
+        if d.held and d.status == "waiting":
+            icon, color = "‖", "33"
         if d.status in ("connecting", "verifying") or \
                 (d.status == "downloading" and d.message.startswith(("retry", OFFLINE_MESSAGE))):
             icon, color = SPINNER[int(time.monotonic() / FRAME_INTERVAL) % len(SPINNER)], SPINNER_COLOR
@@ -1215,6 +1395,8 @@ class Display:
                 note, style = f"{d.message or 'done'} · {human_size(d.total or d.done)}", "2"
             elif d.status == "downloading":  # retrying, or waiting for the internet
                 note, style = d.message, "33"
+            elif d.held and d.status == "waiting":
+                note, style = "paused · p to continue", "33"
             elif d.status == "waiting" and self.selected is not None:
                 place = self._place(d)
                 note, style = ("next" if place == 1 else f"waiting · #{place}"), "2"
@@ -1256,12 +1438,20 @@ class Display:
         if speed:
             parts.append(f"{human_size(speed)}/s total")
         focus = self.queue.focus if self.queue else None
+        playable = [d for d in self.downloads if d.stream and d.status == "downloading" and d.ready() >= STREAM_PLAYABLE]
+        if playable and not self.stopping:
+            d = playable[0]
+            parts.append(f"▶ {clip(d.name, 24).rstrip()}.part plays to {100 * d.ready() / (d.total or 1):.0f}%")
         if self.stopping:
             parts.append("pausing, saving progress · Ctrl+C again to quit now")
+        elif self.removing is not None and self.removing in self.downloads:
+            parts.append(f"x again removes {clip(self.removing.name, 30).rstrip()} from the list")
+        elif self.notice and time.monotonic() < self.notice_until:
+            parts.append(self.notice)
         elif focus is not None:
             parts.append(f"only {clip(focus.name, 24).rstrip()} until it is done · f to share again")
-        elif self.selected is not None and sum(1 for d in self.downloads if d.status not in ("done", "error")) > 1:
-            parts.append("↑↓ select · Enter next · f only this · Ctrl+C pause")
+        elif self.selected is not None and any(d.status not in ("done", "error") for d in self.downloads):
+            parts.append("↑↓ select · Enter next · f only · w watch · p pause · x remove · o open · Ctrl+C stop")
         elif self.watching:
             parts.append("watching the clipboard for links · Ctrl+C to stop")
         elif any(d.status in ("waiting", "connecting", "downloading") for d in self.downloads):
@@ -1315,6 +1505,9 @@ def add_network_options(parser: argparse.ArgumentParser) -> None:
                         help="extra request header, e.g. cookie or referer (repeatable)")
     parser.add_argument("-x", "--proxy", metavar="URL",
                         help="proxy for every request: socks5://host:port, socks5h://... or http://host:port")
+    parser.add_argument("--fallback-proxy", metavar="URL",
+                        help="go direct, and through this SOCKS5 proxy only to servers that cannot be reached "
+                             "directly; 'auto' finds one on this machine, such as v2rayN's or Clash's")
 
 
 def add_download_options(parser: argparse.ArgumentParser) -> None:
@@ -1336,10 +1529,12 @@ def add_download_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--then", choices=("shutdown", "sleep"),
                         help=f"when the downloads end, shut down or sleep the computer, after {THEN_DELAY} "
                              "seconds to cancel with Ctrl+C")
+    parser.add_argument("--stream", action="store_true",
+                        help="fill each file from the start, so a video can be watched while it downloads")
     parser.add_argument("--sound", action="store_const", const=True, default=None,
-                        help="play a soft sound when downloads finish; MOX_SOUND=1 turns it on for good")
+                        help="play a soft sound when downloads finish (the default), even with MOX_SOUND=0")
     parser.add_argument("--no-sound", dest="sound", action="store_const", const=False,
-                        help="no sound this time, even with MOX_SOUND=1")
+                        help="no sound this time; MOX_SOUND=0 turns it off for good")
     parser.add_argument("--no-history", dest="history", action="store_false",
                         help="do not add these downloads to the history ('mox history'); "
                              "MOX_NO_HISTORY=1 turns it off for good")
@@ -1351,6 +1546,16 @@ def check_network_options(parser: argparse.ArgumentParser, args) -> None:
             Proxy(args.proxy)
         except ValueError as e:
             parser.error(str(e))
+    if args.fallback_proxy:
+        if args.proxy:
+            parser.error("--proxy and --fallback-proxy do not go together: --proxy already sends everything")
+        if args.fallback_proxy != "auto" and not args.fallback_proxy.startswith("socks5"):
+            parser.error("--fallback-proxy takes a socks5:// or socks5h:// proxy, or 'auto'")
+        if args.fallback_proxy != "auto":
+            try:
+                Proxy(args.fallback_proxy)
+            except ValueError as e:
+                parser.error(str(e))
     headers = {}
     for header in args.header:
         name, sep, value = header.partition(":")
@@ -1371,7 +1576,165 @@ def check_download_options(parser: argparse.ArgumentParser, args) -> None:
     if history_disabled():
         args.history = False
     if args.sound is None:
-        args.sound = os.environ.get("MOX_SOUND", "") not in ("", "0")
+        args.sound = os.environ.get("MOX_SOUND", "") != "0"
+
+
+# ---------------------------------------------------------------- mox config
+
+# What `mox config` can remember: name -> (what it is, kind of value). Each is the long option of
+# the same name, so a saved setting is a default the command line still overrides.
+CONFIG_KEYS = {
+    "dir": ("folder to save into", "path"),
+    "sort": ("each kind of file in its own folder, series by show and season", "bool"),
+    "stream": ("fill files from the start, to watch while they download", "bool"),
+    "connections": ("connections per file", "int"),
+    "jobs": ("files downloaded at once", "int"),
+    "limit": ("total speed limit, such as 2M", "rate"),
+    "retries": ("retries per connection", "int"),
+    "timeout": ("network timeout in seconds", "float"),
+    "proxy": ("proxy for every request", "proxy"),
+    "fallback-proxy": ("SOCKS5 proxy only for servers unreachable directly, or auto", "fallback"),
+    "notify": ("desktop or Telegram notification when done", "bool"),
+    "sound": ("a soft sound when done", "bool"),
+    "history": ("keep a history of downloads", "bool"),
+}
+ON, OFF = ("on", "yes", "true", "1"), ("off", "no", "false", "0")
+
+
+def config_path() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "mox", "config")
+
+
+def config_value(key: str, text: str):
+    """The setting as the option takes it. Raises ValueError, in words a user can act on."""
+    kind = CONFIG_KEYS[key][1]
+    if kind == "bool":
+        if text.lower() in ON + OFF:
+            return text.lower() in ON
+        raise ValueError("use on or off")
+    if kind == "int":
+        if not text.isdigit() or int(text) < 1:
+            raise ValueError("use a whole number, 1 or more")
+        return int(text)
+    if kind == "float":
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError("use a number of seconds") from None
+    if kind == "rate":
+        try:
+            return parse_rate(text)
+        except argparse.ArgumentTypeError as e:
+            raise ValueError(str(e)) from None
+    if kind == "proxy":
+        Proxy(text)  # its ValueError already says what is wrong
+        return text
+    if kind == "fallback":
+        if text != "auto":
+            if not text.startswith("socks5"):
+                raise ValueError("use a socks5:// or socks5h:// proxy, or auto")
+            Proxy(text)
+        return text
+    return os.path.expanduser(text)
+
+
+def read_config() -> dict[str, str]:
+    """The saved settings as written, 'key = value' lines. Unknown keys are skipped."""
+    settings = {}
+    try:
+        with open(config_path(), encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.partition("=")
+                key = key.strip()
+                if sep and key in CONFIG_KEYS and not key.startswith("#"):
+                    settings[key] = value.strip()
+    except OSError:
+        pass
+    return settings
+
+
+def config_defaults() -> dict:
+    """Saved settings as argparse defaults. A bad one is reported and left out, never fatal."""
+    defaults = {}
+    for key, text in read_config().items():
+        try:
+            defaults[key.replace("-", "_")] = config_value(key, text)
+        except ValueError as e:
+            print(f"! ignoring the setting {key} = {text} in {config_path()}: {e}", file=sys.stderr)
+    return defaults
+
+
+def config_main(argv) -> int:
+    keys = "\n".join(f"  {key:<15}{about}" for key, (about, _) in CONFIG_KEYS.items())
+    parser = argparse.ArgumentParser(
+        prog="mox config", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Remember settings, so a plain 'mox' uses them. Options on the command line still win.",
+        epilog=f"settings:\n{keys}\n\nexamples:\n  mox config dir ~/Downloads\n  mox config sort on\n"
+               "  mox config fallback-proxy auto\n  mox config --unset limit")
+    parser.add_argument("key", nargs="?", choices=list(CONFIG_KEYS), metavar="SETTING")
+    parser.add_argument("value", nargs="?")
+    parser.add_argument("--unset", action="store_true", help="forget the setting")
+    args = parser.parse_args(argv)
+    settings = read_config()
+
+    if args.key is None:
+        print(f"Settings in {config_path()}:" if settings else f"No settings saved yet. They go in {config_path()}.")
+        for key, (about, _) in CONFIG_KEYS.items():
+            print(f"  {key:<15}{settings.get(key, '-'):<22}{about}")
+        print("\nChange one with: mox config SETTING VALUE")
+        return 0
+    if args.unset:
+        settings.pop(args.key, None)
+    elif args.value is None:
+        print(settings.get(args.key, "-"))
+        return 0
+    else:
+        try:
+            config_value(args.key, args.value)
+        except ValueError as e:
+            parser.error(f"{args.key}: {e}")
+        settings[args.key] = args.value
+    write_config(settings)
+    print(f"{args.key}: forgotten" if args.unset else f"{args.key} = {args.value}")
+    return 0
+
+
+def write_config(settings: dict[str, str]) -> None:
+    path = config_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".new", "w", encoding="utf-8") as f:
+        f.write("# mox settings: 'mox config' changes them. Options on the command line still win.\n")
+        f.writelines(f"{key} = {value}\n" for key, value in settings.items())
+    os.replace(path + ".new", path)
+
+
+def ask_for_links() -> list[str]:
+    """For a plain 'mox': the links on the clipboard if the user agrees, or the links they paste."""
+    command = clipboard_command()
+    found = list(dict.fromkeys(urls_in(read_clipboard(command)))) if command else []
+    if found:
+        first = urllib.parse.unquote(urllib.parse.urlsplit(found[0]).path.rsplit("/", 1)[-1]) or found[0]
+        more = f" and {len(found) - 1} more" if len(found) > 1 else ""
+        answer = input(f"{len(found)} link{'s' if len(found) != 1 else ''} on the clipboard ({first}{more}). "
+                       "Download? [Y/n] ")
+        # y typed on a Persian keyboard layout comes out as غ.
+        if answer.strip().lower() in ("", "y", "yes", "غ", "بله", "آره"):
+            return found
+    print("Paste the links, then press Enter on an empty line:", file=sys.stderr)
+    urls: list[str] = []
+    while True:
+        try:
+            line = input().strip()
+        except EOFError:
+            break
+        if not line:
+            break
+        urls += urls_in(line) if "://" in line else [line]
+    return urls
 
 
 def parse_args(argv):
@@ -1379,13 +1742,20 @@ def parse_args(argv):
         prog="mox", description="Fast, resumable, multi-connection downloads in the terminal.",
         epilog="Interrupted downloads resume automatically: run the same command again. "
                "Other commands: 'mox resume [DIR]' continues every unfinished download in a folder, "
-               "'mox history' shows what you have downloaded, "
+               "'mox history' shows what you have downloaded, 'mox config' remembers settings, "
+               "'mox doctor' checks this computer, "
                "'mox bench URL' measures how much faster many connections are.")
     parser.add_argument("urls", nargs="*", metavar="URL")
     parser.add_argument("-i", "--input", metavar="FILE", help="read URLs from FILE, one per line ('-' for stdin)")
     parser.add_argument("-d", "--dir", default=".", help="directory to save into (default: current)")
     parser.add_argument("-o", "--output", metavar="NAME", help="file name to save as (single URL only)")
     parser.add_argument("--sha256", metavar="HEX", help="verify the file against this checksum (single URL only)")
+    parser.add_argument("--page", action="append", default=[], metavar="URL",
+                        help="download the files a web page links to, such as a server's folder listing (repeatable)")
+    parser.add_argument("--match", metavar="TEXT",
+                        help="with --page, only file names containing TEXT, or matching it if it has * or ?")
+    parser.add_argument("-p", "--paste", action="store_true",
+                        help="download the links on the clipboard, even with other text around them")
     parser.add_argument("-w", "--watch", action="store_true",
                         help="keep running and download every file link you copy to the clipboard")
     parser.add_argument("-s", "--sort", action="store_true",
@@ -1393,16 +1763,40 @@ def parse_args(argv):
                              "Documents, Archives, Programs and so on, and episodes in Series/<show>/Season NN")
     add_download_options(parser)
     parser.add_argument("-V", "--version", action="version", version=f"mox {VERSION}")
+    parser.set_defaults(**config_defaults())
     args = parser.parse_args(argv)
 
     urls = list(args.urls)
     if args.input:
         source = sys.stdin if args.input == "-" else open(args.input, encoding="utf-8")
         with source:
-            urls += [line.strip() for line in source if line.strip() and not line.lstrip().startswith("#")]
-    urls = [u if "://" in u else "https://" + u for u in dict.fromkeys(urls)]
-    if not urls and not args.watch:
-        parser.error("give at least one URL (or -i FILE, or --watch)")
+            for line in source:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # A line with a scheme may have text around the link, as text copied from a chat
+                # does: "...here they are:https://...". A bare host/path is taken whole.
+                urls += urls_in(line) if "://" in line else [line]
+    if args.paste:
+        command = clipboard_command()
+        if not command:
+            parser.error("--paste needs a clipboard tool: wl-clipboard, xclip or xsel, or set MOX_CLIPBOARD_COMMAND")
+        found = urls_in(read_clipboard(command))
+        if not found:
+            parser.error("there are no links on the clipboard")
+        urls += found
+    urls = [unescape_link(u if "://" in u else "https://" + u) for u in dict.fromkeys(urls)]
+    if not urls and not args.watch and not args.page:
+        if not (sys.stdin.isatty() and sys.stderr.isatty()):  # a script: say so rather than wait for input
+            parser.error("give at least one URL (or -i FILE, --page URL, --paste or --watch)")
+        urls = [u if "://" in u else "https://" + u for u in dict.fromkeys(ask_for_links())]
+        if not urls:
+            print("Nothing to download.", file=sys.stderr)
+            sys.exit(0)
+    if args.match and not args.page:
+        parser.error("--match works with --page")
+    if args.page and (args.output or args.sha256):
+        parser.error("--output and --sha256 work with a single URL only")
     if (len(urls) > 1 or args.watch) and (args.output or args.sha256):
         parser.error("--output and --sha256 work with a single URL only")
     if args.watch and (args.at or args.until or args.quota or args.then):
@@ -1644,15 +2038,61 @@ def read_clipboard(command: list[str]) -> str:
         return ""
 
 
+def urls_in(text: str) -> list[str]:
+    """Every http(s) link in a piece of text, wherever it sits, without the punctuation around it."""
+    return [unescape_link(url.rstrip(".,;:)]}>")) for url in URL_PATTERN.findall(text)]
+
+
+def unescape_link(url: str) -> str:
+    """A link copied out of a page's HTML can keep its escapes: '...?md5=X&amp;expires=Y'. The
+    server then sees a parameter named 'amp;expires', fails the signature and answers 403, which
+    looks like an expired link. No real link has '&amp;' in it, so turning it back is safe."""
+    return html.unescape(url) if "&" in url else url
+
+
 def links_in(text: str) -> list[str]:
     """File links in a piece of text. Links to web pages are skipped: copying the address of
     an article should not download its HTML."""
+    return [url for url in urls_in(text)
+            if os.path.splitext(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1])[1].lower() not in PAGE_EXTENSIONS]
+
+
+# ---------------------------------------------------------------- --page
+
+PAGE_MAX = 4 * 1024 * 1024  # bytes of a --page read at most; a folder listing is far smaller
+
+
+class _LinkParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.hrefs: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.hrefs += [value for name, value in attrs if name == "href" and value]
+
+
+def page_links(url: str, headers: dict, timeout: float, match: str | None = None) -> list[str]:
+    """The file links on a web page, such as a server's folder listing: no folders, sort links or
+    other pages. With `match`, only names containing it, or matching it if it has * or ?."""
+    with request(url, headers, timeout) as resp:
+        text = resp.read(PAGE_MAX).decode(resp.headers.get_content_charset() or "utf-8", errors="replace")
+        base = resp.geturl()
+    parser = _LinkParser()
+    parser.feed(text)
     links = []
-    for url in URL_PATTERN.findall(text):
-        url = url.rstrip(".,;:)]}>")
-        name = urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
-        if os.path.splitext(name)[1].lower() not in PAGE_EXTENSIONS:
-            links.append(url)
+    for href in parser.hrefs:
+        link = urllib.parse.urljoin(base, href).split("#")[0]
+        parts = urllib.parse.urlsplit(link)
+        name = urllib.parse.unquote(parts.path.rsplit("/", 1)[-1])
+        if parts.scheme not in ("http", "https") or os.path.splitext(name)[1].lower() in PAGE_EXTENSIONS:
+            continue  # folder listings link to subfolders, the parent and ?C=M;O=A sorts: none are files
+        if match:
+            wanted = match.lower()
+            if not (fnmatch.fnmatch(name.lower(), wanted) if any(c in wanted for c in "*?[") else wanted in name.lower()):
+                continue
+        if link not in links:
+            links.append(link)
     return links
 
 
@@ -1676,7 +2116,9 @@ class Scheduler:
         for key, (d, thread, _) in list(self.running.items()):
             if not thread.is_alive():
                 del self.running[key]
-                if d.status == "paused" and not self.stop.is_set():  # paused to make room, not by Ctrl+C
+                if d.removed:
+                    self._drop(d)
+                elif d.status == "paused" and not self.stop.is_set():  # paused to make room, not by Ctrl+C
                     self._requeue(d)
         if self.focus is not None and self.focus.status in ("done", "error"):
             self.focus = None
@@ -1684,7 +2126,7 @@ class Scheduler:
             for _, _, halt in self.running.values():
                 halt.set()
             return
-        pending = [d for d in self.downloads if d.status not in ("done", "error", "paused")]
+        pending = [d for d in self.downloads if d.status not in ("done", "error", "paused") and not d.held]
         wanted = [self.focus] if self.focus is not None else pending[:self.jobs]
         wanted_keys = {id(d) for d in wanted}
         for key, (_, _, halt) in self.running.items():
@@ -1709,9 +2151,39 @@ class Scheduler:
         self.downloads.insert(to, self.downloads.pop(index))
         return to
 
+    def restart(self, d: Download) -> None:
+        """Pause a running download so it starts again, as a fresh copy, with new settings."""
+        if id(d) in self.running:
+            self.running[id(d)][2].set()
+
     def toggle_focus(self, d: Download) -> None:
         if d.status not in ("done", "error"):
             self.focus = None if self.focus is d else d
+            d.held = False
+
+    def toggle_hold(self, d: Download) -> None:
+        """Pause one download, or let it carry on. A paused one waits, keeping its progress."""
+        d.held = not d.held
+        if d.held:
+            self.restart(d)
+            if self.focus is d:
+                self.focus = None
+
+    def remove(self, d: Download) -> None:
+        """Take a download off the list. Its .part and .mox stay, so it can be started again later."""
+        if self.focus is d:
+            self.focus = None
+        if id(d) in self.running:
+            d.removed = True  # dropped once its connections have closed and its state is saved
+            self.running[id(d)][2].set()
+        else:
+            self._drop(d)
+
+    def _drop(self, d: Download) -> None:
+        if d.path:
+            with _claim_lock:
+                _claimed_paths.discard(os.path.abspath(d.path))
+        self.downloads[:] = [x for x in self.downloads if x is not d]
 
     def _requeue(self, d: Download) -> None:
         if d.path:  # free its name, or the new copy would save as 'file (1).mkv' and start over
@@ -1732,7 +2204,8 @@ class Keyboard:
 
     NAMES = {"\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
              "\x1b[1;2A": "move up", "\x1b[1;2B": "move down", "[": "move up", "]": "move down",
-             "\r": "enter", "\n": "enter", "f": "focus", "F": "focus"}
+             "\r": "enter", "\n": "enter", "f": "focus", "F": "focus", "w": "watch", "W": "watch",
+             "p": "pause", "P": "pause", " ": "pause", "x": "remove", "X": "remove", "o": "open", "O": "open"}
     WINDOWS_KEYS = {"H": "\x1b[A", "P": "\x1b[B"}  # what msvcrt gives after "\xe0" for the arrows
     TOKEN = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO.|\x1b|.", re.S)
 
@@ -1796,6 +2269,42 @@ class Keyboard:
             self.fd = None
 
 
+# A .part file has no type a desktop knows, so playing one while it downloads takes a player.
+MEDIA_PLAYERS = (["mpv", "--force-window=yes"], ["vlc"], ["celluloid"], ["totem"])
+
+
+def open_command(path: str, partial: bool) -> list[str] | None:
+    if partial:
+        return next((player + [path] for player in MEDIA_PLAYERS if shutil.which(player[0])), None)
+    if sys.platform == "darwin":
+        return ["open", path]
+    return next(([tool, path] for tool in ("xdg-open", "termux-open") if shutil.which(tool)), None)
+
+
+def open_download(d: Download) -> str:
+    """Open a finished file, or a --stream one that can play already. Returns what to tell the user."""
+    if d.status == "done" and d.path:
+        path, partial = d.path, False
+    elif d.path and d.stream and d.ready() > 0:
+        path, partial = d.path + PART_SUFFIX, True
+    elif d.status == "downloading":
+        return "not done yet; press w to watch it while it downloads"
+    else:
+        return "nothing to open yet"
+    try:
+        if sys.platform == "win32" and not partial:
+            os.startfile(path)  # Windows only
+            return f"opened {clip(d.name, 30).rstrip()}"
+        command = open_command(path, partial)
+        if not command:
+            return "install mpv or VLC to watch while it downloads" if partial else "found nothing to open it with"
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return f"could not open it: {e.strerror or e}"
+    return f"opened in {os.path.basename(command[0])}"
+
+
 def open_keyboard(display: Display, worth_it: bool) -> Keyboard | None:
     """The keys only make sense with a live display and something to reorder."""
     keyboard = Keyboard.open() if display.tty and worth_it else None
@@ -1809,7 +2318,20 @@ def handle_keys(keys: list[str], display: Display, queue: Scheduler) -> None:
         if not display.downloads:
             return
         i = min(display.selected or 0, len(display.downloads) - 1)
-        if key == "up":
+        d = display.downloads[i]
+        removing, display.removing = display.removing, None
+        if key == "pause" and d.status not in ("done", "error"):
+            queue.toggle_hold(d)
+        elif key == "remove":
+            if removing is d:
+                queue.remove(d)
+                display.say(f"removed {clip(d.name, 30).rstrip()}; its .part stays, to continue later")
+                i = min(i, max(0, len(display.downloads) - 1))
+            else:  # one stray x must not drop a download
+                display.removing = d
+        elif key == "open":
+            display.say(open_download(d))
+        elif key == "up":
             i = max(0, i - 1)
         elif key == "down":
             i = min(len(display.downloads) - 1, i + 1)
@@ -1817,9 +2339,13 @@ def handle_keys(keys: list[str], display: Display, queue: Scheduler) -> None:
             i = queue.move(i, i - 1)
         elif key == "move down":
             i = queue.move(i, i + 1)
-        elif key in ("enter", "focus") and display.downloads[i].status not in ("done", "error"):
+        elif key in ("enter", "focus", "watch") and d.status not in ("done", "error"):
+            d.held = False
             if key == "focus":
-                queue.toggle_focus(display.downloads[i])
+                queue.toggle_focus(d)
+            elif key == "watch":
+                d.stream = not d.stream
+                queue.restart(d)  # its pieces are planned already; a fresh start cuts them in order
             i = queue.move(i, queue.front())
         display.selected = i
 
@@ -1838,7 +2364,7 @@ def run_session(downloads: list[Download], args, limiter: RateLimiter, deadline)
     stop = threading.Event()
     queue = Scheduler(downloads, args.jobs, limiter, stop)
     display = Display(downloads, queue=queue)
-    keyboard = open_keyboard(display, len(downloads) > 1)
+    keyboard = open_keyboard(display, True)
     outcome = "finished"
     try:
         try:
@@ -2005,9 +2531,10 @@ def resume_main(argv) -> int:
         epilog="mox remembers each unfinished download in a FILE.mox next to it, link included.")
     parser.add_argument("dir", nargs="?", default=".", help="folder to look in (default: current)")
     add_download_options(parser)
+    parser.set_defaults(**config_defaults())  # 'mox resume' alone looks in the saved dir
     args = parser.parse_args(argv)
     check_download_options(parser, args)
-    configure_proxy(args.proxy)
+    configure_network(args)
 
     downloads = []
     # --sort keeps unfinished downloads in the kind folders, next to where they will end up.
@@ -2110,11 +2637,12 @@ def bench_main(argv) -> int:
     parser.add_argument("-c", "--connections", type=int, default=DEFAULT_CONNECTIONS,
                         help=f"most connections to try (default: {DEFAULT_CONNECTIONS})")
     add_network_options(parser)
+    parser.set_defaults(**{k: v for k, v in config_defaults().items() if k in ("proxy", "fallback_proxy", "timeout")})
     args = parser.parse_args(argv)
     if not 1 <= args.connections <= MAX_CONNECTIONS:
         parser.error(f"--connections must be between 1 and {MAX_CONNECTIONS}")
     check_network_options(parser, args)
-    configure_proxy(args.proxy)
+    configure_network(args)
     url = args.url if "://" in args.url else "https://" + args.url
 
     try:
@@ -2237,6 +2765,16 @@ def traffic_line(entries: list[dict]) -> str:
     Days rather than calendar months: data plans run 30 days from purchase, and the calendar
     month means different things to different users.
     """
+    totals = traffic_totals(entries)
+    if totals is None:
+        return ""
+    labels = ("today", "7 days", "30 days")
+    return "Received " + ", ".join(f"{human_size(total)} {'' if label == 'today' else 'in '}{label}"
+                                   for label, total in zip(labels, totals))
+
+
+def traffic_totals(entries: list[dict]) -> list[int] | None:
+    """Bytes received today, in the last 7 days and in the last 30, or None if nothing was recorded."""
     now = datetime.datetime.now()
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     spans = [("today", today), ("7 days", now - datetime.timedelta(days=7)),
@@ -2255,10 +2793,7 @@ def traffic_line(entries: list[dict]) -> str:
         for i, (_, since) in enumerate(spans):
             if when >= since:
                 totals[i] += received
-    if not seen:
-        return ""
-    return "Received " + ", ".join(f"{human_size(total)} {'' if label == 'today' else 'in '}{label}"
-                                   for (label, _), total in zip(spans, totals))
+    return totals if seen else None
 
 
 def history_main(argv) -> int:
@@ -2314,6 +2849,398 @@ def history_main(argv) -> int:
         for e in entries[-args.list:]:
             when = str(e.get("time", "")).replace("T", " ")[:16]
             print(f"{when}  {human_size(e['size']):>9}  {e.get('kind', 'other'):<10}  {e.get('path') or e.get('name')}")
+    return 0
+
+
+# ---------------------------------------------------------------- mox engine
+
+ENGINE_PIECES = 120  # cells in the piece map sent to an engine client, which draws it at any width
+
+
+class Engine:
+    """mox driven by another program, such as the desktop app (moxdl-desktop).
+
+    Commands come in on stdin and events go out on stdout, one JSON object per line. The engine
+    owns the downloads; a client only asks and draws. Downloads are named by "id", which stays
+    the same when one is paused, moved or restarted.
+
+    Commands ({"cmd": ..., ...}):
+      add        urls: [...] or text (links found anywhere in it), and optionally name, dir,
+                 sort, stream, connections
+      hold       id, on: pause one download (true) or let it carry on (false)
+      next       id: download it next          move     id, to: put it at that place in the list
+      focus      id, or null to share again    stream   id, on: fill it from the start, to watch
+      remove     id: off the list, its .part stays     retry   id: start a failed one again
+      clear      drop finished and failed rows from the list
+      open       id: open the file, or its .part in a player when streaming
+      reveal     id: open its folder           set      jobs and/or limit (bytes/s, "2M", or null)
+      clipboard  the links on the clipboard, as a "clipboard" event
+      config     the saved settings, as a "config" event   config_set   key, value (null forgets it)
+      history    limit: the last downloads and the traffic, as a "history" event
+      quit       pause everything, save progress, and exit
+    Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit;
+    about four times a second), added (ids), finished (id, status, name, message), notice (text),
+    clipboard (urls), config, history, error (text).
+    """
+
+    def __init__(self, args):
+        self.args = args
+        self.downloads: list[Download] = []
+        self.stop = threading.Event()
+        self.limiter = RateLimiter(args.limit)
+        self.queue = Scheduler(self.downloads, args.jobs, self.limiter, self.stop)
+        self.commands: Queue = Queue()
+        self.out_lock = threading.Lock()
+        self.announced: set[int] = set()
+        self.finished_since_idle = 0
+        self.recorded = 0  # traffic already written to the history
+        self.closed = False
+
+    # -- the pipe
+
+    def emit(self, event: dict) -> None:
+        # ASCII JSON: a Windows console pipe may not be UTF-8, and \u escapes survive any.
+        line = json.dumps(event, separators=(",", ":")) + "\n"
+        with self.out_lock:
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except (OSError, ValueError):  # the client went away
+                self.closed = True
+
+    def _read(self) -> None:
+        for line in sys.stdin:
+            self.commands.put(line)
+        self.commands.put(None)  # end of input: the client is gone
+
+    # -- running
+
+    def run(self) -> None:
+        threading.Thread(target=self._read, name="mox engine input", daemon=True).start()
+        self.emit({"type": "hello", "version": VERSION, "settings": read_config(), "jobs": self.queue.jobs,
+                   "limit": self.limiter.rate})
+        last_state = 0.0
+        try:
+            while not self.closed:
+                try:
+                    line = self.commands.get(timeout=FRAME_INTERVAL)
+                except Empty:
+                    line = ""
+                if line is None or (line and self.handle(line) == "quit"):
+                    break
+                self.queue.tick()
+                self._after_tick()
+                if time.monotonic() - last_state >= FRAME_INTERVAL:
+                    self.emit(self.state())
+                    last_state = time.monotonic()
+        except KeyboardInterrupt:
+            pass
+        self.stop.set()
+        while self.queue.running:  # every download saves its progress before the engine exits
+            self.queue.tick()
+            time.sleep(0.1)
+        self._record_traffic()
+        self.emit(self.state())
+
+    def _after_tick(self) -> None:
+        for d in self.downloads:
+            if d.status in ("done", "error") and d.key not in self.announced:
+                self.announced.add(d.key)
+                self.finished_since_idle += d.status == "done"
+                self.emit({"type": "finished", "id": d.key, "status": d.status, "name": d.name,
+                           "message": d.message, "path": d.path})
+        idle = not self.queue.running and not any(d.status == "waiting" and not d.held for d in self.downloads)
+        if idle and self.finished_since_idle:  # the queue just ran dry: the moment the CLI would end
+            if self.args.sound:
+                play_done_sound()
+            self._record_traffic()
+            self.finished_since_idle = 0
+
+    def _record_traffic(self) -> None:
+        if self.args.history and self.limiter.used > self.recorded:
+            record_traffic(self.limiter.used - self.recorded)
+            self.recorded = self.limiter.used
+
+    def state(self) -> dict:
+        downloads = [self.describe(d) for d in self.downloads]
+        return {"type": "state", "version": VERSION, "downloads": downloads, "speed": sum(d["speed"] for d in downloads),
+                "focus": self.queue.focus.key if self.queue.focus else None,
+                "jobs": self.queue.jobs, "limit": self.limiter.rate}
+
+    def describe(self, d: Download) -> dict:
+        speed = d.speed() if d.status == "downloading" else 0.0
+        left = (d.total - d.done) / speed if d.total and speed > 0 else None
+        return {"id": d.key, "url": d.url, "name": d.name, "status": "held" if d.held and d.status == "waiting"
+                else d.status, "message": d.message, "done": d.done, "total": d.total, "speed": round(speed),
+                "eta": round(left) if left is not None else None, "connections": d.active, "kind": d.kind,
+                "path": d.path, "stream": d.stream, "ready": d.ready() if d.stream else None,
+                "pieces": coverage_map(d.pieces(), d.total, ENGINE_PIECES) if d.total else None,
+                "expired": d.error_status in EXPIRED_HTTP}
+
+    # -- commands
+
+    def find(self, key) -> Download:
+        found = next((d for d in self.downloads if d.key == key), None)
+        if found is None:
+            raise ValueError(f"no download with id {key!r}")
+        return found
+
+    def handle(self, line: str) -> str | None:
+        try:
+            command = json.loads(line)
+            name = command.get("cmd")
+            handler = getattr(self, "cmd_" + str(name), None)
+            if handler is None:
+                raise ValueError(f"unknown command {name!r}")
+            return handler(command)
+        except (ValueError, TypeError, AttributeError, KeyError) as e:
+            self.emit({"type": "error", "text": str(e)})
+        return None
+
+    def cmd_add(self, c: dict) -> None:
+        overrides = {key: c[key] for key in ("dir", "sort", "stream", "connections") if c.get(key) is not None}
+        if "dir" in overrides:
+            overrides["dir"] = os.path.expanduser(overrides["dir"])
+        opts = argparse.Namespace(**{**vars(self.args), **overrides})
+        running = {d.url for d in self.downloads if d.status not in ("done", "error")}
+        urls = list(c.get("urls") or [])
+        for line in str(c.get("text") or "").splitlines():  # pasted text, read the way -i reads a file
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls += urls_in(line) if "://" in line else [line]
+        added = []
+        for url in urls:
+            url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
+            if url not in running:  # the same link twice would fight over one file
+                d = Download(url, opts, name=c.get("name") if len(urls) == 1 else None)
+                self.downloads.append(d)
+                running.add(url)
+                added.append(d.key)
+        self.emit({"type": "added", "ids": added})
+
+    def cmd_hold(self, c: dict) -> None:
+        d = self.find(c["id"])
+        if bool(c.get("on", not d.held)) != d.held and d.status not in ("done", "error"):
+            self.queue.toggle_hold(d)
+
+    def cmd_next(self, c: dict) -> None:
+        d = self.find(c["id"])
+        d.held = False
+        self.queue.move(self.downloads.index(d), self.queue.front())
+
+    def cmd_move(self, c: dict) -> None:
+        d = self.find(c["id"])
+        self.queue.move(self.downloads.index(d), int(c["to"]))
+
+    def cmd_focus(self, c: dict) -> None:
+        if c.get("id") is None:
+            self.queue.focus = None
+        else:
+            d = self.find(c["id"])
+            if self.queue.focus is not d:
+                self.queue.toggle_focus(d)
+                self.queue.move(self.downloads.index(d), self.queue.front())
+
+    def cmd_stream(self, c: dict) -> None:
+        d = self.find(c["id"])
+        on = bool(c.get("on", not d.stream))
+        if on != d.stream and d.status not in ("done", "error"):
+            d.stream = on
+            self.queue.restart(d)  # its pieces are planned already; a fresh start cuts them in order
+
+    def cmd_remove(self, c: dict) -> None:
+        self.queue.remove(self.find(c["id"]))
+
+    def cmd_retry(self, c: dict) -> None:
+        d = self.find(c["id"])
+        if d.status == "error":
+            fresh = d.restart()
+            self.downloads[self.downloads.index(d)] = fresh
+            self.announced.discard(d.key)
+
+    def cmd_clear(self, c: dict) -> None:
+        self.downloads[:] = [d for d in self.downloads if d.status not in ("done", "error")]
+
+    def cmd_open(self, c: dict) -> None:
+        self.emit({"type": "notice", "text": open_download(self.find(c["id"]))})
+
+    def cmd_reveal(self, c: dict) -> None:
+        d = self.find(c["id"])
+        folder = os.path.dirname(d.path) if d.path else d.dir
+        command = ["explorer", folder] if sys.platform == "win32" else open_command(folder, False)
+        if command:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=sys.platform != "win32")
+        else:
+            self.emit({"type": "notice", "text": "found nothing to open the folder with"})
+
+    def cmd_set(self, c: dict) -> None:
+        if "jobs" in c:
+            self.queue.jobs = max(1, int(c["jobs"]))
+        if "limit" in c:
+            rate = c["limit"]
+            rate = parse_rate(rate) if isinstance(rate, str) else rate
+            self.limiter.set_rate(int(rate) if rate else None)
+
+    def cmd_clipboard(self, c: dict) -> None:
+        command = clipboard_command()
+        urls = list(dict.fromkeys(urls_in(read_clipboard(command)))) if command else []
+        self.emit({"type": "clipboard", "urls": urls, "tool": command[0] if command else None})
+
+    def cmd_config(self, c: dict) -> None:
+        self.emit({"type": "config", "path": config_path(), "settings": read_config(),
+                   "keys": {key: about for key, (about, _) in CONFIG_KEYS.items()}})
+
+    def cmd_config_set(self, c: dict) -> None:
+        key, value = c["key"], c.get("value")
+        if key not in CONFIG_KEYS:
+            raise ValueError(f"unknown setting {key!r}")
+        settings = read_config()
+        if value is None or value == "":
+            settings.pop(key, None)
+        else:
+            value = str(value)
+            parsed = config_value(key, value)  # its ValueError says what to type
+            settings[key] = value
+            setattr(self.args, key.replace("-", "_"), parsed)  # new downloads use it at once
+        write_config(settings)
+        self.cmd_config(c)
+
+    def cmd_history(self, c: dict) -> None:
+        everything = read_history(history_path())
+        files = [e for e in everything if isinstance(e.get("size"), int) and not isinstance(e.get("size"), bool)]
+        self.emit({"type": "history", "entries": files[-int(c.get("limit", 200)):],
+                   "traffic": traffic_totals(everything), "enabled": bool(self.args.history)})
+
+    def cmd_quit(self, c: dict) -> str:
+        return "quit"
+
+
+def engine_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mox engine", description="Run mox for another program, such as the desktop app: JSON "
+                                       "commands on stdin, JSON events on stdout. See Engine in mox.py.")
+    parser.add_argument("-d", "--dir", default=".", help="default folder to save into (default: current)")
+    parser.add_argument("-s", "--sort", action="store_true", help="sort files into folders by kind")
+    add_download_options(parser)
+    parser.set_defaults(**config_defaults())
+    args = parser.parse_args(argv)
+    check_download_options(parser, args)
+    configure_network(args)
+    Engine(args).run()
+    return 0
+
+
+# ---------------------------------------------------------------- mox doctor
+
+def version_tuple(text: str) -> tuple:
+    return tuple(int(part) for part in re.findall(r"\d+", text))
+
+
+def latest_version() -> str | None:
+    """The newest mox on PyPI, or None when PyPI cannot be reached."""
+    try:
+        with _opener.open("https://pypi.org/pypi/moxdl/json", timeout=5) as resp:
+            return json.load(resp)["info"]["version"]
+    except (OSError, ValueError, KeyError, http.client.HTTPException):
+        return None
+
+
+def doctor_main(argv) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mox doctor", description="Check what mox needs on this computer, and say what to do about what is missing.")
+    parser.parse_args(argv)
+    problems = 0
+
+    def say(state: str, text: str, hint: str = "") -> None:
+        """state: ok, note (worth knowing) or bad (something does not work)."""
+        nonlocal problems
+        problems += state == "bad"
+        print(f"{ {'ok': '✔', 'note': '!', 'bad': '✖'}[state]} {text}")
+        if hint:
+            print(f"    {hint}")
+
+    latest = latest_version()
+    if latest and version_tuple(latest) > version_tuple(VERSION):
+        say("note", f"mox {VERSION}, and {latest} is out", "pipx upgrade moxdl")
+    else:
+        newest = ", the newest" if latest else " (PyPI did not answer, so the newest is unknown)"
+        say("ok", f"mox {VERSION}{newest}, on Python {sys.version.split()[0]}")
+
+    settings, defaults = read_config(), config_defaults()
+    if len(defaults) < len(settings):
+        say("bad", f"some settings in {config_path()} are not valid", "the lines above say which; fix them with mox config")
+    elif settings:
+        say("ok", f"{len(settings)} saved setting{'s' if len(settings) != 1 else ''}: "
+                  + ", ".join(f"{k} {v}" for k, v in settings.items()), "mox config shows and changes them")
+    else:
+        say("note", "no saved settings", "mox config dir ~/Downloads, for example, saves where files go")
+
+    folder = defaults.get("dir", ".")
+    try:
+        free = shutil.disk_usage(folder).free
+        if not os.access(folder, os.W_OK):
+            say("bad", f"cannot write to {folder}", "pick another folder: mox config dir FOLDER")
+        else:
+            say("ok" if free > 5 * 1024 ** 3 else "note", f"{human_size(free)} free in {os.path.abspath(folder)}")
+    except OSError:
+        say("bad", f"the download folder {folder} does not exist", "mox makes it on the first download, or pick another")
+
+    reachable = any(can_connect(host, port, None) for host, port in online_checks())
+    say("ok" if reachable else "bad", "the internet answers directly" if reachable else "no direct internet connection",
+        "" if reachable else "if you use a proxy app, try mox config fallback-proxy auto")
+    system = next((os.environ[name] for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy")
+                   if os.environ.get(name)), None)
+    local = find_local_proxy()
+    fallback = defaults.get("fallback_proxy") or defaults.get("proxy")
+    if fallback:
+        say("ok", f"proxy setting: {fallback}")
+    elif system:
+        say("note", f"every download goes through the system proxy {re.sub(r'//[^@/]*@', '//', system)}",
+            "mox config fallback-proxy auto goes direct, and through the proxy only where it must")
+    elif local:
+        say("note", f"a proxy listens at {local}, and mox does not use it",
+            "mox config fallback-proxy auto uses it for servers that cannot be reached directly")
+
+    clipboard = clipboard_command()
+    say("ok" if clipboard else "bad", f"clipboard: {clipboard[0]}" if clipboard else "no clipboard tool, so --paste, "
+        "--watch and a plain 'mox' cannot read copied links",
+        "" if clipboard else "install wl-clipboard (Wayland), xclip (X11) or termux-api (Termux)")
+
+    sound = defaults.get("sound")
+    sound = os.environ.get("MOX_SOUND", "") != "0" if sound is None else sound
+    player = "winsound" if sys.platform == "win32" else next(
+        (p for p in ("pw-play", "paplay", "aplay", "afplay", "termux-media-player") if shutil.which(p)), None)
+    if not sound:
+        say("note", "the sound when downloads finish is off", "mox config sound on, or unset MOX_SOUND")
+    elif not player:
+        say("bad", "no program to play the sound when downloads finish",
+            "install pipewire-bin, pulseaudio-utils or alsa-utils")
+    else:
+        say("ok", f"sound through {player}: playing it now")
+        play_done_sound()
+
+    notifier = next((t for t in ("notify-send", "termux-notification", "osascript") if shutil.which(t)), None)
+    telegram = os.environ.get("MOX_TELEGRAM_TOKEN") and os.environ.get("MOX_TELEGRAM_CHAT")
+    say("ok" if notifier or telegram else "note",
+        "notifications: " + " and ".join(filter(None, [notifier, "Telegram" if telegram else None]))
+        if notifier or telegram else "no desktop notification tool, so --notify can only use Telegram",
+        "" if telegram else "set MOX_TELEGRAM_TOKEN and MOX_TELEGRAM_CHAT for Telegram messages, see the README")
+
+    keyboard = Keyboard.open() if sys.stdin.isatty() else None
+    if keyboard:
+        keyboard.close()
+    say("ok" if keyboard else "note", "keys work while downloading" if keyboard
+        else "no terminal to read keys from here, so ↑↓, Enter and the other keys are off")
+
+    history = defaults.get("history", True) and not history_disabled()
+    if history:
+        count = sum(1 for e in read_history(history_path()) if isinstance(e.get("size"), int))
+        say("ok", f"history: {count} download{'s' if count != 1 else ''} in {history_path()}", "mox history shows them")
+    else:
+        say("note", "no history is kept", "mox config history on keeps one")
+
+    print("\nAll good." if not problems else f"\n{problems} thing{'s' if problems != 1 else ''} to fix, above.")
     return 0
 
 
@@ -2384,8 +3311,26 @@ def run_command(argv) -> int:
         return bench_main(argv[1:])
     if argv and argv[0] == "history":
         return history_main(argv[1:])
+    if argv and argv[0] == "config":
+        return config_main(argv[1:])
+    if argv and argv[0] == "doctor":
+        return doctor_main(argv[1:])
+    if argv and argv[0] == "engine":
+        return engine_main(argv[1:])
     args = parse_args(argv)
-    configure_proxy(args.proxy)
+    configure_network(args)
+    for page in args.page:
+        page = page if "://" in page else "https://" + page
+        try:
+            found = page_links(page, args.headers, args.timeout, args.match)
+        except (RETRYABLE_ERRORS + (FatalError,)) as e:
+            print(f"✖ cannot read {page}: {reason(e)}", file=sys.stderr)
+            return 1
+        if not found:
+            matching = f" matching {args.match!r}" if args.match else ""
+            print(f"✖ {page} links to no files{matching}.", file=sys.stderr)
+            return 1
+        args.urls = list(dict.fromkeys(args.urls + found))
     downloads = [Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
     if not args.watch:
         return run_downloads(downloads, args)
