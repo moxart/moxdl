@@ -1303,6 +1303,10 @@ class Display:
             self._log_changes()
             return
         size = shutil.get_terminal_size((100, 24))
+        # Up to Python 3.10 a terminal that reports no size, as a fresh pseudo-terminal does,
+        # came back as 0 columns, and the redraw below divided by it. 3.11 falls back by itself.
+        if size.columns <= 0 or size.lines <= 0:
+            size = os.terminal_size((100, 24))
         # One column spare: a row that fills the last column leaves some terminals waiting to wrap.
         width = size.columns - 1
         visible = self._visible(max(1, size.lines - 2))

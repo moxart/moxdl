@@ -593,6 +593,17 @@ class MoxTest(unittest.TestCase):
         d.message = ""
         self.assertEqual(icon_at(0), "↓")  # moving data shows the arrow, not the spinner
 
+    def test_display_on_a_terminal_without_a_size(self):
+        mox = load_mox()
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.status, d.total, d.done = "downloading", 1000, 300
+        display = mox.Display([d], stream=io.StringIO())
+        display.tty = True
+        with mock.patch("shutil.get_terminal_size", return_value=os.terminal_size((0, 0))):
+            display.draw()
+            display.draw()  # the second frame moves up over the first, which divided by the width
+        self.assertIn("30.0%", display.stream.getvalue())
+
     def test_display_redraw_after_resize(self):
         mox = load_mox()
 
