@@ -690,6 +690,21 @@ class MoxTest(unittest.TestCase):
         self.assertDownloaded()
         self.assertEqual(sorted(os.listdir(self.out)), ["big.bin"])
 
+    def test_clipboard_tool_on_gnome(self):
+        mox = load_mox()
+        gnome = {"WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0", "XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}
+        only = lambda *tools: (lambda name: f"/usr/bin/{name}" if name in tools else None)
+        with mock.patch.dict(os.environ, gnome), mock.patch.object(mox.shutil, "which", only("wl-paste")):
+            self.assertEqual(mox.clipboard_command(), mox.TK_CLIPBOARD)  # not wl-paste, which takes the focus
+        with mock.patch.dict(os.environ, gnome), mock.patch.object(mox.shutil, "which", only("wl-paste", "xclip")):
+            self.assertEqual(mox.clipboard_command()[0], "xclip")
+        with mock.patch.dict(os.environ, {**gnome, "XDG_CURRENT_DESKTOP": "sway"}), \
+                mock.patch.object(mox.shutil, "which", only("wl-paste", "xclip")):
+            self.assertEqual(mox.clipboard_command()[0], "wl-paste")  # elsewhere wl-paste needs no window
+        with mock.patch.dict(os.environ, gnome), mock.patch.object(mox.shutil, "which", only("wl-paste")), \
+                mock.patch.object(mox, "tk_available", return_value=False):
+            self.assertEqual(mox.clipboard_command()[0], "wl-paste")  # the last resort
+
     def test_watch_without_clipboard_tool(self):
         env = {k: v for k, v in os.environ.items() if k not in ("MOX_CLIPBOARD_COMMAND", "WAYLAND_DISPLAY")}
         env["PATH"] = self.temp_dir("mox-empty-path-")

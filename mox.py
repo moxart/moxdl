@@ -2063,14 +2063,36 @@ PAGE_EXTENSIONS = {"", ".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".cgi"}
 CLIPBOARD_POLL = 1.0  # seconds between clipboard reads in --watch mode
 
 
+# Reads the X11 clipboard with the standard library alone, from a window that is never shown.
+TK_CLIPBOARD = [sys.executable, "-c", "import tkinter; t = tkinter.Tk(); t.withdraw(); "
+                "print(t.clipboard_get(), end='')"]
+
+
+def tk_available() -> bool:
+    try:
+        import tkinter  # noqa: F401  part of the standard library, but often a separate package
+    except ImportError:
+        return False
+    return True
+
+
 def clipboard_command() -> list[str] | None:
     custom = os.environ.get("MOX_CLIPBOARD_COMMAND")
     if custom:
         return shlex.split(custom)
-    candidates = [["wl-paste", "--no-newline"]] if os.environ.get("WAYLAND_DISPLAY") else []
-    candidates += [["xclip", "-o", "-selection", "clipboard"], ["xsel", "--clipboard", "--output"],
-                   ["pbpaste"], ["termux-clipboard-get"],
-                   ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"]]
+    x11 = [["xclip", "-o", "-selection", "clipboard"], ["xsel", "--clipboard", "--output"]]
+    wayland = [["wl-paste", "--no-newline"]] if os.environ.get("WAYLAND_DISPLAY") else []
+    if wayland and "GNOME" in os.environ.get("XDG_CURRENT_DESKTOP", "") and os.environ.get("DISPLAY"):
+        # GNOME gives other programs no way to read the clipboard, so wl-paste opens a window to
+        # take the focus first: --watch, reading every second, made the screen flicker and the
+        # desktop app froze. Through Xwayland, which GNOME keeps in step, no window is needed.
+        found = next((c for c in x11 if shutil.which(c[0])), None)
+        if found:
+            return found
+        if tk_available():
+            return TK_CLIPBOARD
+    candidates = wayland + x11 + [["pbpaste"], ["termux-clipboard-get"],
+                                  ["powershell.exe", "-NoProfile", "-Command", "Get-Clipboard"]]
     return next((c for c in candidates if shutil.which(c[0])), None)
 
 
@@ -3360,7 +3382,8 @@ def doctor_main(argv) -> int:
             "mox config fallback-proxy auto uses it for servers that cannot be reached directly")
 
     clipboard = clipboard_command()
-    say("ok" if clipboard else "bad", f"clipboard: {clipboard[0]}" if clipboard else "no clipboard tool, so --paste, "
+    tool = ("Python's tkinter, through X11" if clipboard == TK_CLIPBOARD else clipboard[0]) if clipboard else ""
+    say("ok" if clipboard else "bad", f"clipboard: {tool}" if clipboard else "no clipboard tool, so --paste, "
         "--watch and a plain 'mox' cannot read copied links",
         "" if clipboard else "install wl-clipboard (Wayland), xclip (X11) or termux-api (Termux)")
 
