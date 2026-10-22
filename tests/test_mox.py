@@ -1413,6 +1413,35 @@ class MoxTest(unittest.TestCase):
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
+    def test_engine_schedule_and_quota(self):
+        proc, send, wait_for = self.start_engine("-l", "2M")
+        # A window that has just closed: nothing may run.
+        now = datetime.datetime.now()
+        closed = {"from": (now - datetime.timedelta(hours=2)).strftime("%H:%M"),
+                  "until": (now - datetime.timedelta(hours=1)).strftime("%H:%M")}
+        send(cmd="set", window=closed)
+        send(cmd="add", urls=[f"{self.base}/big.bin"])
+        state = wait_for("state", lambda e: e["gate"] == "schedule" and e["downloads"])
+        self.assertEqual(state["window"], closed)
+        time.sleep(1)
+        self.assertEqual(wait_for("state")["downloads"][0]["done"], 0)
+        send(cmd="set", window=None)  # open again: it runs
+        wait_for("state", lambda e: e["gate"] is None and e["downloads"][0]["done"] > 0)
+        # A quota already used up today pauses it, keeping what it has.
+        send(cmd="set", quota="1M")
+        self.assertIn("reached", wait_for("notice")["text"])
+        paused = wait_for("state", lambda e: e["gate"] == "quota" and e["downloads"][0]["status"] == "waiting")
+        self.assertGreaterEqual(paused["today"], 1024 * 1024)
+        send(cmd="set", quota=None, limit=None)
+        self.assertEqual(wait_for("finished")["status"], "done")
+        self.assertDownloaded()
+        send(cmd="set", window={"from": "25:00", "until": "07:00"})  # a bad time is an error, not a crash
+        self.assertIn("invalid", wait_for("error")["text"])
+        send(cmd="set", limit="fast")
+        wait_for("error")
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
     def test_engine_keeps_its_list(self):
         state = os.path.join(self.temp_dir("mox-state-"), "queue.json")
         # Slow enough that neither file can finish before the quit, even on a slow CI machine.

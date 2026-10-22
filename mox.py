@@ -2185,6 +2185,7 @@ class Scheduler:
         self.downloads, self.jobs, self.limiter, self.stop = downloads, jobs, limiter, stop
         self.running: dict[int, tuple[Download, threading.Thread, threading.Event]] = {}
         self.focus: Download | None = None
+        self.gate: str | None = None  # why nothing may run now ("schedule", "quota"), or None
 
     def tick(self) -> None:
         """Start, pause and requeue downloads to match the list. Called once per frame."""
@@ -2202,7 +2203,7 @@ class Scheduler:
                 halt.set()
             return
         pending = [d for d in self.downloads if d.status not in ("done", "error", "paused") and not d.held]
-        wanted = [self.focus] if self.focus is not None else pending[:self.jobs]
+        wanted = [] if self.gate else [self.focus] if self.focus is not None else pending[:self.jobs]
         wanted_keys = {id(d) for d in wanted}
         for key, (_, _, halt) in self.running.items():
             if key not in wanted_keys:
@@ -2952,14 +2953,17 @@ class Engine:
       remove     id: off the list, its .part stays     retry   id: start a failed one again
       clear      drop finished and failed rows from the list
       open       id: open the file, or its .part in a player when streaming
-      reveal     id: open its folder           set      jobs and/or limit (bytes/s, "2M", or null)
+      reveal     id: open its folder           set      jobs, limit (bytes/s, "2M", or null),
+                 window ({"from": "02:00", "until": "07:00"}, or null: download only then)
+                 and quota (bytes a day, "5G", or null: pause once today has had that much)
       clipboard  the links on the clipboard, as a "clipboard" event; files: true leaves out
                  links to web pages, as --watch does
       config     the saved settings, as a "config" event   config_set   key, value (null forgets it)
       history    limit: the last downloads and the traffic, as a "history" event
       quit       pause everything, save progress, and exit
     Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit,
-    free: bytes free where downloads go;
+    free: bytes free where downloads go, window, quota, today: bytes received today, gate: why
+    nothing runs now, "schedule" or "quota", or null;
     about four times a second), added (ids), finished (id, status, name, message), notice (text),
     clipboard (urls), config, history, error (text).
 
@@ -2981,6 +2985,11 @@ class Engine:
         self.closed = False
         self.saved: list[dict] | None = None  # the list as last written to --state
         self.free: tuple[float, int | None] = (0.0, None)  # (when checked, bytes free in the default dir)
+        self.window: tuple[datetime.time, datetime.time] | None = None  # download only between these
+        self.quota: int | None = None  # bytes a day
+        # Today's traffic: what the history had for today when last counted, and how much of
+        # limiter.used was in the history by then; see _received_today.
+        self.today: tuple[datetime.date | None, int, int] = (None, 0, 0)
 
     # -- the pipe
 
@@ -3015,6 +3024,7 @@ class Engine:
                     line = ""
                 if line is None or (line and self.handle(line) == "quit"):
                     break
+                self._set_gate()
                 self.queue.tick()
                 self._after_tick()
                 self._save_list()
@@ -3110,7 +3120,31 @@ class Engine:
         downloads = [self.describe(d) for d in self.downloads]
         return {"type": "state", "version": VERSION, "downloads": downloads, "speed": sum(d["speed"] for d in downloads),
                 "focus": self.queue.focus.key if self.queue.focus else None,
-                "jobs": self.queue.jobs, "limit": self.limiter.rate, "free": self._free_space()}
+                "jobs": self.queue.jobs, "limit": self.limiter.rate, "free": self._free_space(),
+                "window": {"from": show_clock(self.window[0])[:5], "until": show_clock(self.window[1])[:5]}
+                if self.window else None,
+                "quota": self.quota, "today": self._received_today(), "gate": self.queue.gate}
+
+    def _received_today(self) -> int:
+        """Bytes received today, by this run and by others, as the history counts them."""
+        day, counted, recorded = self.today
+        if day != datetime.date.today():  # first asked, or midnight passed: count afresh
+            totals = traffic_totals(read_history(history_path())) if self.args.history else None
+            day, counted, recorded = datetime.date.today(), (totals or [0])[0], self.recorded
+            self.today = (day, counted, recorded)
+        return counted + self.limiter.used - recorded
+
+    def _set_gate(self) -> None:
+        """Let the queue run, or hold it shut, by the schedule and the daily quota."""
+        gate = None
+        if self.window and not in_window(datetime.datetime.now(), *self.window):
+            gate = "schedule"
+        elif self.quota and self._received_today() >= self.quota:
+            gate = "quota"
+        if gate != self.queue.gate:
+            if gate == "quota":
+                self.emit({"type": "notice", "text": f"today's {human_size(self.quota)} is reached: paused until tomorrow"})
+            self.queue.gate = gate
 
     def _free_space(self) -> int | None:
         """Bytes free where downloads go by default, looked up at most once a second."""
@@ -3149,7 +3183,9 @@ class Engine:
             if handler is None:
                 raise ValueError(f"unknown command {name!r}")
             return handler(command)
-        except (ValueError, TypeError, AttributeError, KeyError) as e:
+        # argparse.ArgumentTypeError is what parse_rate and parse_clock raise: a bad limit or time
+        # from a client once got past this and ended the engine.
+        except (ValueError, TypeError, AttributeError, KeyError, argparse.ArgumentTypeError) as e:
             self.emit({"type": "error", "text": str(e)})
         return None
 
@@ -3263,6 +3299,15 @@ class Engine:
             rate = c["limit"]
             rate = parse_rate(rate) if isinstance(rate, str) else rate
             self.limiter.set_rate(int(rate) if rate else None)
+        if "window" in c:
+            w = c["window"]
+            start, end = (parse_clock(w["from"]), parse_clock(w["until"])) if w else (None, None)
+            if w and start == end:
+                raise ValueError("the window must start and end at different times")
+            self.window = (start, end) if w else None
+        if "quota" in c:
+            quota = c["quota"]
+            self.quota = (parse_size(quota) if isinstance(quota, str) else int(quota)) if quota else None
 
     def cmd_clipboard(self, c: dict) -> None:
         # On a thread of its own: reading can take seconds (wl-paste on GNOME opens a window to
