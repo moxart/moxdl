@@ -1365,6 +1365,17 @@ class MoxTest(unittest.TestCase):
         send(cmd="hold", id=a, on=False)
         self.assertEqual(wait_for("finished", lambda e: e["id"] == a)["status"], "done")
 
+        # first: ahead of what waits, in the order given.
+        send(cmd="hold_all", on=True)
+        send(cmd="add", urls=[f"{self.base}/norange/empty.bin"])
+        waiting = wait_for("added")["ids"][0]
+        send(cmd="add", urls=[f"{self.base}/alt/empty.bin", f"{self.base}/short/empty.bin"], first=True)
+        f1, f2 = wait_for("added")["ids"]
+        rows = [d["id"] for d in wait_for("state")["downloads"]]
+        self.assertLess(rows.index(f1), rows.index(f2))
+        self.assertLess(rows.index(f2), rows.index(waiting))
+        send(cmd="hold_all", on=False)
+
         send(cmd="add", text=f"two links:{self.base}/empty.bin\n# a comment\nand {self.base}/empty.bin again")
         self.assertEqual(len(wait_for("added")["ids"]), 1)  # found in the text, and only once
         send(cmd="nonsense")

@@ -2945,7 +2945,7 @@ class Engine:
 
     Commands ({"cmd": ..., ...}):
       add        urls: [...] or text (links found anywhere in it), and optionally name, dir,
-                 sort, stream, connections
+                 sort, stream, connections, and first: true to put them ahead of the queue
       hold       id, on: pause one download (true) or let it carry on (false)
       hold_all   on: the same for every unfinished download
       next       id: download it next          move     id, to: put it at that place in the list
@@ -3225,6 +3225,13 @@ class Engine:
                     same.url = url  # used from its next connection, and saved in its .mox
                     if same.status == "waiting":
                         same.final_url = url
+        if c.get("first"):
+            # Ahead of everything waiting, in the order given, as "download next" does for one.
+            front = self.queue.front()
+            for place, key in enumerate(added):
+                d = self.find(key)
+                d.held = False
+                self.queue.move(self.downloads.index(d), front + place)
         self.emit({"type": "added", "ids": added})
         if refreshed:
             self.emit({"type": "notice", "text": f"{refreshed} already in the list: "
