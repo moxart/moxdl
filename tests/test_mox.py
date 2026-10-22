@@ -1383,6 +1383,20 @@ class MoxTest(unittest.TestCase):
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
+    def test_engine_reads_the_clipboard(self):
+        clipboard = os.path.join(self.temp_dir("mox-clipboard-"), "clipboard")
+        with open(clipboard, "w") as f:
+            f.write("see https://example.com/blog/post.html and https://example.com/files/a.zip")
+        os.environ["MOX_CLIPBOARD_COMMAND"] = f"cat {clipboard}"
+        self.addCleanup(os.environ.pop, "MOX_CLIPBOARD_COMMAND", None)
+        proc, send, wait_for = self.start_engine()
+        send(cmd="clipboard")
+        self.assertEqual(len(wait_for("clipboard")["urls"]), 2)
+        send(cmd="clipboard", files=True)  # what the desktop app offers to download: files, not pages
+        self.assertEqual(wait_for("clipboard")["urls"], ["https://example.com/files/a.zip"])
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
     def test_engine_keeps_its_list(self):
         state = os.path.join(self.temp_dir("mox-state-"), "queue.json")
         # Slow enough that neither file can finish before the quit, even on a slow CI machine.

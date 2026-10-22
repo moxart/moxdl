@@ -2931,7 +2931,8 @@ class Engine:
       clear      drop finished and failed rows from the list
       open       id: open the file, or its .part in a player when streaming
       reveal     id: open its folder           set      jobs and/or limit (bytes/s, "2M", or null)
-      clipboard  the links on the clipboard, as a "clipboard" event
+      clipboard  the links on the clipboard, as a "clipboard" event; files: true leaves out
+                 links to web pages, as --watch does
       config     the saved settings, as a "config" event   config_set   key, value (null forgets it)
       history    limit: the last downloads and the traffic, as a "history" event
       quit       pause everything, save progress, and exit
@@ -3229,9 +3230,15 @@ class Engine:
             self.limiter.set_rate(int(rate) if rate else None)
 
     def cmd_clipboard(self, c: dict) -> None:
-        command = clipboard_command()
-        urls = list(dict.fromkeys(urls_in(read_clipboard(command)))) if command else []
-        self.emit({"type": "clipboard", "urls": urls, "tool": command[0] if command else None})
+        # On a thread of its own: reading can take seconds (wl-paste on GNOME opens a window to
+        # get the focus first), and the engine's loop stopping meanwhile froze the app with it.
+        def read() -> None:
+            command = clipboard_command()
+            text = read_clipboard(command) if command else ""
+            urls = list(dict.fromkeys(links_in(text) if c.get("files") else urls_in(text)))
+            self.emit({"type": "clipboard", "urls": urls, "tool": command[0] if command else None,
+                       "files": bool(c.get("files"))})
+        threading.Thread(target=read, name="mox engine clipboard", daemon=True).start()
 
     def cmd_config(self, c: dict) -> None:
         self.emit({"type": "config", "path": config_path(), "settings": read_config(),
