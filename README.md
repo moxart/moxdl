@@ -182,7 +182,7 @@ mox --watch -d ~/Downloads
 
 mox downloads every file link you copy, and skips links to web pages. Ctrl+C stops it.
 
-On Linux it needs `wl-paste`, `xclip` or `xsel`. If your clipboard tool isn't supported, set `MOX_CLIPBOARD_COMMAND` to a command that prints the clipboard.
+On Linux it needs `wl-paste`, `xclip` or `xsel`. On GNOME under Wayland, where `wl-paste` would flash a window and take the focus every second, mox reads through X11 instead, with `xclip`, `xsel` or Python's tkinter. If your clipboard tool isn't supported, set `MOX_CLIPBOARD_COMMAND` to a command that prints the clipboard.
 
 ### History
 
