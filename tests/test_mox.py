@@ -1350,6 +1350,7 @@ class MoxTest(unittest.TestCase):
         row = state["downloads"][0]
         self.assertEqual((row["id"], row["status"], row["done"], row["total"]), (first, "done", SIZE, SIZE))
         self.assertEqual(len(row["pieces"]), 120)
+        self.assertGreater(state["free"], 0)
 
         # Queue control: one at a time, the second link moved ahead of the first.
         send(cmd="set", jobs=1, limit="2M")

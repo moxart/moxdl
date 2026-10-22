@@ -2958,7 +2958,8 @@ class Engine:
       config     the saved settings, as a "config" event   config_set   key, value (null forgets it)
       history    limit: the last downloads and the traffic, as a "history" event
       quit       pause everything, save progress, and exit
-    Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit;
+    Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit,
+    free: bytes free where downloads go;
     about four times a second), added (ids), finished (id, status, name, message), notice (text),
     clipboard (urls), config, history, error (text).
 
@@ -2979,6 +2980,7 @@ class Engine:
         self.recorded = 0  # traffic already written to the history
         self.closed = False
         self.saved: list[dict] | None = None  # the list as last written to --state
+        self.free: tuple[float, int | None] = (0.0, None)  # (when checked, bytes free in the default dir)
 
     # -- the pipe
 
@@ -3108,7 +3110,18 @@ class Engine:
         downloads = [self.describe(d) for d in self.downloads]
         return {"type": "state", "version": VERSION, "downloads": downloads, "speed": sum(d["speed"] for d in downloads),
                 "focus": self.queue.focus.key if self.queue.focus else None,
-                "jobs": self.queue.jobs, "limit": self.limiter.rate}
+                "jobs": self.queue.jobs, "limit": self.limiter.rate, "free": self._free_space()}
+
+    def _free_space(self) -> int | None:
+        """Bytes free where downloads go by default, looked up at most once a second."""
+        checked, free = self.free
+        if time.monotonic() - checked >= 1:
+            try:
+                free = shutil.disk_usage(self.args.dir).free
+            except OSError:  # the folder is not made yet, or the disk is gone
+                free = None
+            self.free = (time.monotonic(), free)
+        return free
 
     def describe(self, d: Download) -> dict:
         speed = d.speed() if d.status == "downloading" else 0.0
