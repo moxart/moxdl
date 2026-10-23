@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "moxdl"
-version = "1.10"
+version = "1.11"
 description = "Fast, resumable, multi-connection downloads in the terminal"
 readme = "README.md"
 # The table form is deprecated, but the plain "MIT" form needs setuptools 77, which no
