@@ -8,6 +8,8 @@ Server paths:
     /busy/<file>      answers 503 when more than 4 requests are in flight
     /named/<file>     sends a UTF-8 Content-Disposition file name
     /gone/<file>      403, like an expired signed link
+    /cookie/<file>    403 unless the request carries Cookie: session=ok and a Referer, like a
+                      download that needs the browser's login
     /alt/<file>       the same file under another URL
     /short/<file>     closes every connection after 1 MB
     /stall/<file>     sends 256 KB per request, then goes silent for 15 seconds
@@ -32,6 +34,7 @@ import os
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -92,7 +95,8 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isfile(path):
             self.send_error(404)
             return
-        if mode == "gone":
+        login = mode == "cookie" and (self.headers.get("Cookie") != "session=ok" or not self.headers.get("Referer"))
+        if mode == "gone" or login:
             self.send_response(403)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -1450,6 +1454,100 @@ class MoxTest(unittest.TestCase):
         self.assertIn("invalid", wait_for("error")["text"])
         send(cmd="set", limit="fast")
         wait_for("error")
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def test_engine_slow_hours_and_polite(self):
+        proc, send, wait_for = self.start_engine()
+        now = datetime.datetime.now()
+        around = {"from": (now - datetime.timedelta(hours=1)).strftime("%H:%M"),
+                  "until": (now + datetime.timedelta(hours=1)).strftime("%H:%M")}
+        send(cmd="set", limit="4M", slow={**around, "limit": "1M"})
+        state = wait_for("state", lambda e: e["lowered"] == "slow")
+        self.assertEqual((state["limit"], state["rate"]), (4 * 1024 ** 2, 1024 ** 2))  # what was asked stays apart
+        self.assertEqual(state["slow"], {**around, "limit": 1024 ** 2})
+        send(cmd="set", polite=512 * 1024)  # someone at the computer: lower still
+        state = wait_for("state", lambda e: e["lowered"] == "polite")
+        self.assertEqual(state["rate"], 512 * 1024)
+        send(cmd="set", polite=None, slow=None)
+        state = wait_for("state", lambda e: e["lowered"] is None)
+        self.assertEqual(state["rate"], 4 * 1024 ** 2)
+        send(cmd="set", slow={**around, "limit": 0})
+        self.assertIn("above zero", wait_for("error")["text"])
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def test_engine_checks_links(self):
+        proc, send, wait_for = self.start_engine()
+        send(cmd="check", text=f"{self.base}/big.bin and {self.base}/gone/big.bin")
+        found = {}
+        while len(found) < 2:
+            event = wait_for("checked")
+            found[event["url"]] = event
+        good, gone = found[f"{self.base}/big.bin"], found[f"{self.base}/gone/big.bin"]
+        self.assertEqual((good["ok"], good["size"], good["name"], good["ranges"]), (True, SIZE, "big.bin", True))
+        self.assertEqual((gone["ok"], gone["expired"]), (False, True))
+        done = wait_for("check_done")
+        self.assertEqual(done["count"], 2)
+        self.assertGreater(done["free"], 0)
+        self.assertEqual(os.listdir(self.out), [])  # asked, not downloaded
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def test_engine_then_and_known_files(self):
+        proc, send, wait_for = self.start_engine()
+        elsewhere = self.temp_dir("mox-moved-")
+        marker = "import sys; open(sys.argv[1] + '.seen', 'w').close()"
+        run = f"{shlex.quote(sys.executable)} -c {shlex.quote(marker)}"
+        send(cmd="add", urls=[f"{self.base}/big.bin?t=1"], then={"move": elsewhere, "run": run})
+        first = wait_for("added")["ids"][0]
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == first)["status"], "done")
+        self.assertIn("moved", wait_for("notice")["text"])
+        moved = os.path.join(elsewhere, "big.bin")
+        deadline = time.monotonic() + 10
+        while not os.path.exists(moved + ".seen") and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertEqual(sha256(moved), self.digest)
+        self.assertTrue(os.path.exists(moved + ".seen"))  # the command ran on the moved file
+        self.assertEqual(os.listdir(self.out), [])
+        # The same file again, under a fresh link, is reported rather than downloaded twice.
+        send(cmd="add", urls=[f"{self.base}/big.bin?t=2"], skip_known=True)
+        self.assertEqual(wait_for("added")["ids"], [])
+        known = wait_for("known")["items"]
+        self.assertEqual([(k["path"], k["url"]) for k in known], [(moved, f"{self.base}/big.bin?t=2")])
+        send(cmd="add", urls=[f"{self.base}/big.bin?t=3"], then={"run": "'unclosed"})
+        self.assertIn("quotation", wait_for("error")["text"])
+        send(cmd="history")
+        self.assertEqual(len(wait_for("history")["daily"]), 30)
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def test_engine_sends_a_downloads_headers(self):
+        state = os.path.join(self.temp_dir("mox-state-"), "queue.json")
+        proc, send, wait_for = self.start_engine("--state", state)
+        send(cmd="add", urls=[f"{self.base}/cookie/big.bin?plain"])
+        plain = wait_for("added")["ids"][0]
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == plain)["status"], "error")  # no login
+        login = {"Cookie": "session=ok", "Referer": f"{self.base}/page"}
+        # The same file again, now with the browser's login: the failed row takes it, and starts again.
+        send(cmd="add", urls=[f"{self.base}/cookie/big.bin"], headers=login)
+        self.assertEqual(wait_for("added")["ids"], [])
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == plain)["status"], "done")
+        self.assertEqual(sha256(os.path.join(self.out, "big.bin")), self.digest)
+        # Kept for a restart, and where only its owner can read it.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not os.path.exists(state):
+            time.sleep(0.1)
+        with open(state, encoding="utf-8") as f:
+            saved = [e["headers"] for e in json.load(f)["downloads"]]
+        self.assertIn(login, saved)
+        if os.name == "posix":
+            self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+        # A line break would smuggle in a header of its own: refused.
+        send(cmd="add", urls=[f"{self.base}/big.bin?x"], headers={"Cookie": "a=b\r\nX-Evil: 1"})
+        self.assertIn("one line", wait_for("error")["text"])
+        send(cmd="add", urls=[f"{self.base}/big.bin?y"], headers={"Bad Name": "1"})
+        self.assertIn("header name", wait_for("error")["text"])
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 

@@ -69,6 +69,11 @@ ONLINE_CHECK_SHARED = 1.0
 OFFLINE_MESSAGE = "no internet, waiting for it to come back"
 SOUND_PEAK = 0.07       # loudness of --sound, about -23 dBFS: noticeable, never startling
 THEN_DELAY = 60         # seconds of warning before --then shuts down or sleeps, time to press Ctrl+C
+SPACE_SPARE = 64 * 1024 * 1024  # free space beyond its own need before a download that ran out starts again
+SPACE_POLL = 5          # seconds between looks at the disk for downloads waiting for space
+CHECK_THREADS = 6       # links an engine "check" asks about at once
+HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")  # a header name as HTTP allows it
+MOST_HEADERS, MOST_HEADER_SIZE = 20, 16384  # what one download may bring along; a cookie can be long
 RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 BUSY_HTTP = {429, 503}  # the server wants fewer connections
 EXPIRED_HTTP = {401, 403, 410}  # what an expired signed link usually returns
@@ -81,6 +86,13 @@ class FatalError(Exception):
     def __init__(self, message: str, status: int | None = None):
         super().__init__(message)
         self.status = status
+
+
+class NoSpace(FatalError):
+    """Not enough disk space for a file. The engine waits for space rather than giving up."""
+
+    def __init__(self, message: str):
+        super().__init__(message, "space")
 
 
 class ServerBusy(ConnectionError):
@@ -695,6 +707,7 @@ class Download:
         self.kind = "other"
         self.stream = getattr(opts, "stream", False)  # fill the file from the start, to watch while it downloads
         self.held = False  # paused with the p key: it waits until p again
+        self.then: dict = {}  # for mox engine: open, move to a folder, or run a command once done
         self.removed = False  # taken off the list with the x key while it ran
         self.device: int | None = None  # the disk it is written to, for _check_space
         self.dir = opts.dir  # --dir, or the folder --sort picks for this kind of file
@@ -715,6 +728,7 @@ class Download:
         fresh.key = self.key
         fresh.dir = self.dir  # mox resume finds some in --sort folders, which its options do not name
         fresh.stream, fresh.held = self.stream, self.held  # the w and p keys
+        fresh.then = self.then
         return fresh
 
     def requeue(self) -> Download:
@@ -879,8 +893,8 @@ class Download:
             needed = self._space_needed()
             if needed + others > free:
                 busy = f" and {human_size(others)} for the downloads under way" if others else ""
-                raise FatalError(f"not enough disk space: needs {human_size(needed)}{busy}, "
-                                 f"{human_size(free)} free")
+                raise NoSpace(f"not enough disk space: needs {human_size(needed)}{busy}, "
+                              f"{human_size(free)} free")
             self.device = device
             _writing.add(self)
 
@@ -2852,6 +2866,41 @@ def traffic_line(entries: list[dict]) -> str:
                                    for label, total in zip(labels, totals))
 
 
+def clean_headers(value) -> dict:
+    """Request headers from a client, checked: names HTTP allows, values on one line. Anything
+    else is refused, since a line break in a value would add a header of its own."""
+    if not value:
+        return {}
+    if not isinstance(value, dict) or len(value) > MOST_HEADERS:
+        raise ValueError("headers must be an object of at most 20 names and values")
+    clean = {}
+    for name, text in value.items():
+        if not isinstance(name, str) or not HEADER_NAME.fullmatch(name):
+            raise ValueError(f"not a header name: {name!r}")
+        if not isinstance(text, str) or len(text) > MOST_HEADER_SIZE or any(c in text for c in "\r\n\0"):
+            raise ValueError(f"the {name} header is not one line of text")
+        if text:
+            clean[name] = text
+    return clean
+
+
+def traffic_daily(entries: list[dict], days: int = 30) -> list[list]:
+    """[date, bytes] for each of the last `days` days, oldest first, today last: for a chart."""
+    today = datetime.date.today()
+    totals = {today - datetime.timedelta(days=n): 0 for n in range(days)}
+    for e in entries:
+        received = e.get("traffic")
+        if not isinstance(received, int) or isinstance(received, bool):
+            continue
+        try:
+            day = datetime.datetime.fromisoformat(str(e.get("time"))).date()
+        except ValueError:
+            continue
+        if day in totals:
+            totals[day] += received
+    return [[day.isoformat(), totals[day]] for day in sorted(totals)]
+
+
 def traffic_totals(entries: list[dict]) -> list[int] | None:
     """Bytes received today, in the last 7 days and in the last 30, or None if nothing was recorded."""
     now = datetime.datetime.now()
@@ -2945,7 +2994,16 @@ class Engine:
 
     Commands ({"cmd": ..., ...}):
       add        urls: [...] or text (links found anywhere in it), and optionally name, dir,
-                 sort, stream, connections, and first: true to put them ahead of the queue
+                 sort, stream, connections, headers ({"Cookie": ..., "Referer": ...}: sent
+                 with every request for these, as from the browser that started them; kept
+                 in --state, which is written readable by its owner alone), first: true to
+                 put them ahead of the queue,
+                 then (see the then command), and skip_known: true to leave out files the
+                 history has, still on disk, and report them in a "known" event instead
+      then       id, then: {"open": true, "move": folder, "run": command}, what to do with
+                 the file once done, in that order; the command gets the file's path last
+      check      urls or text, and optionally dir: ask each server about its file without
+                 downloading, a "checked" event each, then "check_done" (free: bytes free in dir)
       hold       id, on: pause one download (true) or let it carry on (false)
       hold_all   on: the same for every unfinished download
       next       id: download it next          move     id, to: put it at that place in the list
@@ -2954,8 +3012,10 @@ class Engine:
       clear      drop finished and failed rows from the list
       open       id: open the file, or its .part in a player when streaming
       reveal     id: open its folder           set      jobs, limit (bytes/s, "2M", or null),
-                 window ({"from": "02:00", "until": "07:00"}, or null: download only then)
-                 and quota (bytes a day, "5G", or null: pause once today has had that much)
+                 window ({"from": "02:00", "until": "07:00"}, or null: download only then),
+                 quota (bytes a day, "5G", or null: pause once today has had that much),
+                 slow ({"from", "until", "limit"}, or null: a lower limit between those times)
+                 and polite (bytes/s, or null: a lower limit while someone uses the computer)
       clipboard  the links on the clipboard, as a "clipboard" event; files: true leaves out
                  links to web pages, as --watch does
       config     the saved settings, as a "config" event   config_set   key, value (null forgets it)
@@ -2963,9 +3023,12 @@ class Engine:
       quit       pause everything, save progress, and exit
     Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit,
     free: bytes free where downloads go, window, quota, today: bytes received today, gate: why
-    nothing runs now, "schedule" or "quota", or null;
-    about four times a second), added (ids), finished (id, status, name, message), notice (text),
-    clipboard (urls), config, history, error (text).
+    nothing runs now, "schedule" or "quota", or null, slow, rate: the limit in force now, and
+    why it is lower than limit, "slow" or "polite", or null, offline: seconds since the internet
+    went down, or null; about four times a second), added (ids), finished (id, status, name,
+    message), notice (text), clipboard (urls), config, history (also daily: bytes received on
+    each of the last 30 days, oldest first), known (items), checked, check_done, error (text).
+    A download waiting for disk space shows as "nospace", and starts again once there is room.
 
     With --state FILE the list outlives the engine: it is written to FILE whenever it changes,
     and read back on start, where the unfinished downloads carry on from their .mox files.
@@ -2987,6 +3050,12 @@ class Engine:
         self.free: tuple[float, int | None] = (0.0, None)  # (when checked, bytes free in the default dir)
         self.window: tuple[datetime.time, datetime.time] | None = None  # download only between these
         self.quota: int | None = None  # bytes a day
+        self.base_limit: int | None = args.limit  # the limit asked for; slow hours and polite lower it
+        self.slow: tuple[datetime.time, datetime.time, int] | None = None  # a lower limit between two times
+        self.polite: int | None = None  # a lower limit while someone uses the computer, set by the app
+        self.lowered: str | None = None  # why the limit in force is below base_limit
+        self.offline_since: float | None = None  # when the downloads found the internet down
+        self.space_checked = 0.0  # when the downloads waiting for space last looked at the disk
         # Today's traffic: what the history had for today when last counted, and how much of
         # limiter.used was in the history by then; see _received_today.
         self.today: tuple[datetime.date | None, int, int] = (None, 0, 0)
@@ -3025,6 +3094,8 @@ class Engine:
                 if line is None or (line and self.handle(line) == "quit"):
                     break
                 self._set_gate()
+                self._set_rate()
+                self._retry_when_space()
                 self.queue.tick()
                 self._after_tick()
                 self._save_list()
@@ -3050,7 +3121,8 @@ class Engine:
                 "sort": bool(getattr(d.opts, "sort", False)), "stream": d.stream,
                 "connections": d.opts.connections, "held": d.held, "status": status, "path": d.path,
                 "size": d.total if d.total is not None else d.done, "kind": d.kind,
-                "message": d.message if status == "error" else "", "error_status": d.error_status}
+                "message": d.message if status == "error" else "", "error_status": d.error_status,
+                "then": d.then, "headers": getattr(d.opts, "extra_headers", None) or {}}
 
     def _save_list(self) -> None:
         if not getattr(self.args, "state", None):
@@ -3060,7 +3132,9 @@ class Engine:
             return
         try:
             os.makedirs(os.path.dirname(os.path.abspath(self.args.state)), exist_ok=True)
-            with open(self.args.state + ".new", "w", encoding="utf-8") as f:
+            # Its owner alone may read it: it can hold a site's cookies, for downloads that need a login.
+            with open(self.args.state + ".new", "w", encoding="utf-8",
+                      opener=lambda path, flags: os.open(path, flags, 0o600)) as f:
                 json.dump({"version": 1, "downloads": entries}, f)
             os.replace(self.args.state + ".new", self.args.state)
             self.saved = entries
@@ -3077,10 +3151,13 @@ class Engine:
             return
         for entry in entries:
             try:
+                extra = clean_headers(entry.get("headers"))
                 opts = argparse.Namespace(**{**vars(self.args), "dir": entry["dir"], "sort": entry["sort"],
-                                             "stream": entry["stream"], "connections": entry["connections"]})
+                                             "stream": entry["stream"], "connections": entry["connections"],
+                                             "headers": {**self.args.headers, **extra}, "extra_headers": extra})
                 d = Download(entry["url"], opts, name=entry.get("name"))
                 d.name, d.kind = entry.get("shown") or d.name, entry.get("kind") or d.kind
+                d.then = entry.get("then") or {}
                 if entry["status"] == "done":
                     if not (entry.get("path") and os.path.exists(entry["path"])):
                         continue  # moved or deleted since: nothing to show
@@ -3099,17 +3176,72 @@ class Engine:
 
     def _after_tick(self) -> None:
         for d in self.downloads:
-            if d.status in ("done", "error") and d.key not in self.announced:
+            if d.status in ("done", "error") and d.key not in self.announced and d.error_status != "space":
                 self.announced.add(d.key)
                 self.finished_since_idle += d.status == "done"
                 self.emit({"type": "finished", "id": d.key, "status": d.status, "name": d.name,
                            "message": d.message, "path": d.path})
+                if d.status == "done" and d.then:
+                    threading.Thread(target=self._then, args=(d,), name="mox engine then", daemon=True).start()
         idle = not self.queue.running and not any(d.status == "waiting" and not d.held for d in self.downloads)
         if idle and self.finished_since_idle:  # the queue just ran dry: the moment the CLI would end
             if self.args.sound:
                 play_done_sound()
             self._record_traffic()
             self.finished_since_idle = 0
+
+    def _then(self, d: Download) -> None:
+        """Move, open and run, as the download's then asks. A failure is told, and stops the rest."""
+        try:
+            folder = d.then.get("move")
+            if folder:
+                folder = os.path.expanduser(str(folder))
+                os.makedirs(folder, exist_ok=True)
+                target = os.path.join(folder, os.path.basename(d.path))
+                if os.path.exists(target):  # never over another file: the same rule as downloading
+                    stem, ext = os.path.splitext(target)
+                    target = next(f"{stem} ({n}){ext}" for n in itertools.count(1)
+                                  if not os.path.exists(f"{stem} ({n}){ext}"))
+                shutil.move(d.path, target)
+                d.path = target
+                self.emit({"type": "notice", "text": f"{d.name} moved to {folder}"})
+            if d.then.get("open"):
+                self.emit({"type": "notice", "text": open_download(d)})
+            command = d.then.get("run")
+            if command:
+                words = shlex.split(str(command), posix=os.name != "nt")
+                subprocess.Popen(words + [d.path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=os.name != "nt")
+        except (OSError, ValueError) as e:  # a missing folder or program, a bad command line
+            self.emit({"type": "error", "text": f"after {d.name}: {e}"})
+
+    def _retry_when_space(self) -> None:
+        """Start again the downloads that stopped for want of disk space, once there is room."""
+        waiting = [d for d in self.downloads if d.status == "error" and d.error_status == "space"]
+        if not waiting or time.monotonic() - self.space_checked < SPACE_POLL:
+            return
+        self.space_checked = time.monotonic()
+        for d in waiting:
+            try:
+                free = shutil.disk_usage(d.dir).free
+            except OSError:
+                continue
+            if free >= d._space_needed() + SPACE_SPARE:
+                fresh = d.restart()
+                self.downloads[self.downloads.index(d)] = fresh
+
+    def _set_rate(self) -> None:
+        """The limit in force: the one asked for, lowered in the slow hours and while someone
+        uses the computer, whichever is lowest."""
+        limits = [(self.base_limit, None)]
+        if self.slow and in_window(datetime.datetime.now(), self.slow[0], self.slow[1]):
+            limits.append((self.slow[2], "slow"))
+        if self.polite:
+            limits.append((self.polite, "polite"))
+        rate, why = min(((r, w) for r, w in limits if r), default=(None, None), key=lambda x: x[0])
+        self.lowered = why
+        if rate != self.limiter.rate:
+            self.limiter.set_rate(rate)
 
     def _record_traffic(self) -> None:
         if self.args.history and self.limiter.used > self.recorded:
@@ -3120,10 +3252,23 @@ class Engine:
         downloads = [self.describe(d) for d in self.downloads]
         return {"type": "state", "version": VERSION, "downloads": downloads, "speed": sum(d["speed"] for d in downloads),
                 "focus": self.queue.focus.key if self.queue.focus else None,
-                "jobs": self.queue.jobs, "limit": self.limiter.rate, "free": self._free_space(),
+                "jobs": self.queue.jobs, "limit": self.base_limit, "free": self._free_space(),
                 "window": {"from": show_clock(self.window[0])[:5], "until": show_clock(self.window[1])[:5]}
                 if self.window else None,
-                "quota": self.quota, "today": self._received_today(), "gate": self.queue.gate}
+                "quota": self.quota, "today": self._received_today(), "gate": self.queue.gate,
+                "slow": {"from": show_clock(self.slow[0])[:5], "until": show_clock(self.slow[1])[:5],
+                         "limit": self.slow[2]} if self.slow else None,
+                "rate": self.limiter.rate, "lowered": self.lowered, "offline": self._offline()}
+
+    def _offline(self) -> int | None:
+        """Seconds since the downloads found the internet down, or None while it works."""
+        down = any(d.message == OFFLINE_MESSAGE for d in self.downloads if d.status in ("connecting", "downloading"))
+        if not down:
+            self.offline_since = None
+            return None
+        if self.offline_since is None:
+            self.offline_since = time.monotonic()
+        return round(time.monotonic() - self.offline_since)
 
     def _received_today(self) -> int:
         """Bytes received today, by this run and by others, as the history counts them."""
@@ -3160,12 +3305,13 @@ class Engine:
     def describe(self, d: Download) -> dict:
         speed = d.speed() if d.status == "downloading" else 0.0
         left = (d.total - d.done) / speed if d.total and speed > 0 else None
-        return {"id": d.key, "url": d.url, "name": d.name, "status": "held" if d.held and d.status == "waiting"
-                else d.status, "message": d.message, "done": d.done, "total": d.total, "speed": round(speed),
+        status = ("held" if d.held and d.status == "waiting" else
+                  "nospace" if d.status == "error" and d.error_status == "space" else d.status)
+        return {"id": d.key, "url": d.url, "name": d.name, "status": status, "message": d.message, "done": d.done, "total": d.total, "speed": round(speed),
                 "eta": round(left) if left is not None else None, "connections": d.active, "kind": d.kind,
                 "path": d.path, "stream": d.stream, "ready": d.ready() if d.stream else None,
                 "pieces": coverage_map(d.pieces(), d.total, ENGINE_PIECES) if d.total else None,
-                "expired": d.error_status in EXPIRED_HTTP}
+                "expired": d.error_status in EXPIRED_HTTP, "then": d.then}
 
     # -- commands
 
@@ -3191,10 +3337,17 @@ class Engine:
 
     def cmd_add(self, c: dict) -> None:
         overrides = {key: c[key] for key in ("dir", "sort", "stream", "connections") if c.get(key) is not None}
+        extra = clean_headers(c.get("headers"))
+        if extra:
+            overrides["headers"] = {**self.args.headers, **extra}
+            overrides["extra_headers"] = extra
         if "dir" in overrides:
             overrides["dir"] = os.path.expanduser(overrides["dir"])
         opts = argparse.Namespace(**{**vars(self.args), **overrides})
         known = {file_link(d.url): d for d in self.downloads if d.status != "done"}
+        have = self._known_files() if c.get("skip_known") else {}
+        then = self._then_from(c.get("then"))
+        skipped = []
         urls = list(c.get("urls") or [])
         for line in str(c.get("text") or "").splitlines():  # pasted text, read the way -i reads a file
             line = line.strip()
@@ -3204,25 +3357,31 @@ class Engine:
         for url in urls:
             url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
             same = known.get(file_link(url))
-            if same is None:
+            if same is None and link_without_secrets(url) in have:
+                skipped.append({**have[link_without_secrets(url)], "url": url})
+            elif same is None:
                 d = Download(url, opts, name=c.get("name") if len(urls) == 1 else None)
+                d.then = then
                 self.downloads.append(d)
                 known[file_link(url)] = d
                 added.append(d.key)
-            elif same.url != url:
+            elif same.url != url or extra:
                 # The same file under a fresh link: download sites sign each link anew, so a list
                 # copied twice came back as a second row that downloaded the file again, as
                 # "name (1)". The fresh link replaces the old one instead, and restarts the row
-                # if the old link had failed, as an expired one does.
+                # if the old link had failed, as an expired one does. Headers that come with it,
+                # the browser's login after a try without it, replace the row's own.
                 refreshed += 1
+                row_opts = argparse.Namespace(**{**vars(same.opts), "headers": {**self.args.headers, **extra},
+                                                 "extra_headers": extra}) if extra else same.opts
                 if same.status == "error":
-                    fresh = Download(url, same.opts, same.custom_name, same.sha256)
+                    fresh = Download(url, row_opts, same.custom_name, same.sha256)
                     fresh.key, fresh.dir, fresh.stream, fresh.held = same.key, same.dir, same.stream, same.held
                     self.downloads[self.downloads.index(same)] = fresh
                     self.announced.discard(same.key)
                     known[file_link(url)] = fresh
                 else:
-                    same.url = url  # used from its next connection, and saved in its .mox
+                    same.url, same.opts = url, row_opts  # used from its next connection, and saved
                     if same.status == "waiting":
                         same.final_url = url
         if c.get("first"):
@@ -3233,9 +3392,86 @@ class Engine:
                 d.held = False
                 self.queue.move(self.downloads.index(d), front + place)
         self.emit({"type": "added", "ids": added})
+        if skipped:
+            self.emit({"type": "known", "items": skipped})
         if refreshed:
             self.emit({"type": "notice", "text": f"{refreshed} already in the list: "
                                                  f"{'its link was' if refreshed == 1 else 'their links were'} updated"})
+
+    def _known_files(self) -> dict:
+        """Files downloaded before and still where they were saved, by their link without its
+        query: from the history, and from the finished rows in the list."""
+        found = {}
+        for e in read_history(history_path()) if self.args.history else []:
+            path, url = e.get("path"), e.get("url")
+            if isinstance(path, str) and isinstance(url, str) and os.path.exists(path):
+                found[url] = {"name": e.get("name") or os.path.basename(path), "path": path,
+                              "time": e.get("time"), "size": e.get("size")}
+        for d in self.downloads:
+            if d.status == "done" and d.path and os.path.exists(d.path):
+                found[link_without_secrets(d.url)] = {"name": d.name, "path": d.path, "time": None, "size": d.total}
+        return found
+
+    @staticmethod
+    def _then_from(value) -> dict:
+        if not value:
+            return {}
+        if not isinstance(value, dict):
+            raise ValueError("then must be an object such as {\"open\": true}")
+        then = {}
+        if value.get("open"):
+            then["open"] = True
+        for key in ("move", "run"):
+            if isinstance(value.get(key), str) and value[key].strip():
+                then[key] = value[key].strip()
+        if "run" in then:
+            shlex.split(then["run"], posix=os.name != "nt")  # a bad command line is refused now, not after hours
+        return then
+
+    def cmd_then(self, c: dict) -> None:
+        self.find(c["id"]).then = self._then_from(c.get("then"))
+
+    def cmd_check(self, c: dict) -> None:
+        """Ask each server about its file, on threads of their own: some take a timeout to answer."""
+        urls = list(c.get("urls") or [])
+        urls += urls_in(str(c.get("text") or ""))
+        # Each answer names its link exactly as it came, for the client to match it up.
+        urls = list(dict.fromkeys(u.strip() for u in urls if u.strip()))
+        folder = os.path.expanduser(c.get("dir") or self.args.dir)
+        jobs: Queue = Queue()
+        for url in urls:
+            jobs.put(url)
+
+        def ask() -> None:
+            while True:
+                try:
+                    url = jobs.get_nowait()
+                except Empty:
+                    return
+                try:
+                    _, total, ranges, name, _, _ = probe(unescape_link(url), self.args.headers, self.args.timeout)
+                    self.emit({"type": "checked", "url": url, "ok": True, "size": total, "name": name,
+                               "ranges": ranges})
+                except (FatalError, *RETRYABLE_ERRORS) as e:
+                    status = getattr(e, "status", None) or getattr(e, "code", None)
+                    self.emit({"type": "checked", "url": url, "ok": False,
+                               "message": str(e) if isinstance(e, FatalError) else reason(e),
+                               "expired": status in EXPIRED_HTTP})
+
+        def run() -> None:
+            workers = [threading.Thread(target=ask, name="mox engine check", daemon=True)
+                       for _ in range(min(CHECK_THREADS, len(urls)))]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join()
+            try:
+                free = shutil.disk_usage(folder).free
+            except OSError:
+                free = None
+            self.emit({"type": "check_done", "count": len(urls), "free": free})
+
+        threading.Thread(target=run, name="mox engine checks", daemon=True).start()
 
     def cmd_hold(self, c: dict) -> None:
         d = self.find(c["id"])
@@ -3305,7 +3541,21 @@ class Engine:
         if "limit" in c:
             rate = c["limit"]
             rate = parse_rate(rate) if isinstance(rate, str) else rate
-            self.limiter.set_rate(int(rate) if rate else None)
+            self.base_limit = int(rate) if rate else None
+        if "slow" in c:
+            w = c["slow"]
+            if w:
+                start, end = parse_clock(w["from"]), parse_clock(w["until"])
+                rate = parse_rate(w["limit"]) if isinstance(w["limit"], str) else int(w["limit"])
+                if start == end or rate <= 0:
+                    raise ValueError("slow hours need two different times and a limit above zero")
+                self.slow = (start, end, rate)
+            else:
+                self.slow = None
+        if "polite" in c:
+            rate = c["polite"]
+            self.polite = (parse_rate(rate) if isinstance(rate, str) else int(rate)) if rate else None
+        self._set_rate()
         if "window" in c:
             w = c["window"]
             start, end = (parse_clock(w["from"]), parse_clock(w["until"])) if w else (None, None)
@@ -3350,7 +3600,8 @@ class Engine:
         everything = read_history(history_path())
         files = [e for e in everything if isinstance(e.get("size"), int) and not isinstance(e.get("size"), bool)]
         self.emit({"type": "history", "entries": files[-int(c.get("limit", 200)):],
-                   "traffic": traffic_totals(everything), "enabled": bool(self.args.history)})
+                   "traffic": traffic_totals(everything), "daily": traffic_daily(everything),
+                   "enabled": bool(self.args.history)})
 
     def cmd_quit(self, c: dict) -> str:
         return "quit"
