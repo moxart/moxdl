@@ -1551,6 +1551,61 @@ class MoxTest(unittest.TestCase):
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
+    def test_learns_connections_per_server(self):
+        mox = load_mox()
+        # A server never seen: the default first, and nothing learned yet.
+        self.assertEqual(mox.choose_connections("a.example"), (16, False))
+        # Each count is tried once, in order...
+        tried = []
+        for speed in (10e6, 4e6, 30e6, 1e6):  # 16, 8, 32 and 4 connections gave these
+            n, _ = mox.choose_connections("a.example")
+            tried.append(n)
+            mox.learn_connections("a.example", n, speed)
+        self.assertEqual(tried, [16, 8, 32, 4])
+        # ...then the fastest is used, and learned is said.
+        self.assertEqual(mox.choose_connections("a.example"), (32, True))
+        # Another server learns apart.
+        self.assertEqual(mox.choose_connections("b.example"), (16, False))
+        # Servers change: a few slow downloads move it off the count that was best.
+        for _ in range(6):
+            n, _ = mox.choose_connections("a.example")
+            mox.learn_connections("a.example", n, 0.5e6 if n == 32 else 12e6)
+        self.assertNotEqual(mox.choose_connections("a.example")[0], 32)
+        self.assertTrue(os.path.exists(mox.learned_path()))
+
+    def test_best_hours(self):
+        mox = load_mox()
+        hours = [[5, 2e6] for _ in range(24)]
+        self.assertIsNone(mox.best_hours(hours))  # all alike: nothing worth saying
+        for h in (2, 3, 4, 5):
+            hours[h][1] = 6e6
+        best = mox.best_hours(hours)
+        self.assertEqual((best["from"], best["until"]), ("02:00", "06:00"))
+        self.assertGreaterEqual(best["factor"], 2)
+        self.assertIsNone(mox.best_hours([[1, 6e6] for _ in range(24)]))  # too few samples to say
+
+    def test_engine_learns_and_forgets(self):
+        proc, send, wait_for = self.start_engine()
+        send(cmd="learned")
+        learned = wait_for("learned")
+        self.assertEqual((len(learned["hours"]), learned["best"], learned["enabled"]), (24, None, True))
+        mox = load_mox()
+        mox.learn_connections("127.0.0.1", 8, 5e6)
+        send(cmd="learned")
+        self.assertEqual(wait_for("learned")["servers"], 1)
+        send(cmd="forget")
+        self.assertEqual(wait_for("learned")["servers"], 0)
+        self.assertFalse(os.path.exists(mox.learned_path()))
+        # A queue of known size gets a forecast; an empty one none.
+        self.assertIsNone(wait_for("state")["forecast"])
+        send(cmd="set", limit="1M")
+        send(cmd="add", urls=[f"{self.base}/big.bin"])
+        state = wait_for("state", lambda e: e["downloads"] and e["downloads"][0]["status"] == "downloading"
+                         and e["downloads"][0]["speed"] > 0)
+        self.assertGreater(state["forecast"], 0)
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
     def test_engine_keeps_its_list(self):
         state = os.path.join(self.temp_dir("mox-state-"), "queue.json")
         # Slow enough that neither file can finish before the quit, even on a slow CI machine.

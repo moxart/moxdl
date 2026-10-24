@@ -45,11 +45,11 @@ Many servers cap the speed of each connection, so more connections means more sp
 | `mox` (16 connections) | 1.8 s | 51.7 MB/s |
 | `mox -c 32` | 1.1 s | 88.2 MB/s |
 
-Some servers gain nothing or refuse extra connections. `mox bench URL` measures what a server allows and suggests a `-c` value. It downloads nothing to disk.
+Some servers gain nothing or refuse extra connections. mox learns that by itself: it tries a few counts on each server over your downloads (16 first, then 8, 32 and 4), and from then on uses the one that was fastest, now and then trying the others again, as servers change. `mox bench URL` measures it at once, and suggests a `-c` value; it downloads nothing to disk. A `-c` you give, or one in `mox config`, is used as given.
 
 ## Features
 
-- Up to 64 connections per file, 16 by default.
+- Up to 64 connections per file: as many as suit each server, learned from your earlier downloads, or as many as you say.
 - The progress bar shows which parts of each file are done.
 - Fast connections take over work from slow ones.
 - Very slow connections are reopened.
@@ -198,7 +198,7 @@ $ mox history
 
 It also shows how much was received today and in the last 7 and 30 days, unfinished downloads included, to keep an eye on a data plan. `-l` also lists the last 20 downloads with where they were saved (`-l 50` for more), `-k video` shows one kind, and `--clear` erases it all. The history is a text file, `~/.local/share/mox/history.jsonl` (`%APPDATA%\mox` on Windows). Links are saved without their `?query` part, where signed links keep their keys.
 
-To leave a download out, use `--no-history`. To keep no history at all, set `MOX_NO_HISTORY=1`.
+To leave a download out, use `--no-history`. To keep no history at all, set `MOX_NO_HISTORY=1`. What mox learns, the connections that suit each server and how fast the internet usually is at each hour, sits beside it in `learned.json`, follows the same switches, and stays on your computer.
 
 ### Night downloads
 
@@ -313,7 +313,7 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `-p, --paste` | | Download the links on the clipboard |
 | `--page URL` | | Download the files a page links to, repeatable |
 | `--match TEXT` | | With `--page`, only names containing `TEXT` or matching it |
-| `-c, --connections N` | 16 | Connections per file, 1 to 64 |
+| `-c, --connections N` | learned | Connections per file, 1 to 64. Without it, what suits each server, learned from earlier downloads (16 for a server not seen yet) |
 | `-j, --jobs N` | 3 | Files downloaded at the same time |
 | `-l, --limit RATE` | none | Total speed limit, such as `500K` or `2M` |
 | `-r, --retries N` | 10 | Retries per connection before giving up |

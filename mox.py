@@ -74,6 +74,19 @@ SPACE_POLL = 5          # seconds between looks at the disk for downloads waitin
 CHECK_THREADS = 6       # links an engine "check" asks about at once
 HEADER_NAME = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")  # a header name as HTTP allows it
 MOST_HEADERS, MOST_HEADER_SIZE = 20, 16384  # what one download may bring along; a cookie can be long
+# Learning, in learned.json beside the history: the connections that suit each server, and how
+# fast the internet is at each hour of the day. It follows the history setting, on or off.
+LEARN_ARMS = (16, 8, 32, 4)   # connection counts tried per server, in the order first tried
+LEARN_EXPLORE = 0.3           # how much an arm tried less often is favoured (UCB1's constant, scaled)
+LEARN_MIN_BYTES = 8 * 1024 * 1024  # a download teaches only when it moved this much...
+LEARN_MIN_SECONDS = 5.0       # ...over this long, with no speed limit: else it measured the limit
+LEARN_MEMORY = 5              # a mean weighs the last few downloads most, as servers change
+LEARN_HOSTS = 500             # servers remembered; the least recently used go first
+HOUR_EVERY = 60               # seconds between samples of the engine's total speed
+HOUR_SAVE_EVERY = 300         # seconds between writes of what the hours taught
+HOURS_KNOWN = 16              # hours of the day with samples before a best time is suggested
+BEST_SPAN = 4                 # hours in a suggested best time
+BEST_FACTOR = 1.4             # how much faster than usual that time must be to be worth saying
 RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 BUSY_HTTP = {429, 503}  # the server wants fewer connections
 EXPIRED_HTTP = {401, 403, 410}  # what an expired signed link usually returns
@@ -708,6 +721,8 @@ class Download:
         self.stream = getattr(opts, "stream", False)  # fill the file from the start, to watch while it downloads
         self.held = False  # paused with the p key: it waits until p again
         self.then: dict = {}  # for mox engine: open, move to a folder, or run a command once done
+        self.connections = getattr(opts, "connections", DEFAULT_CONNECTIONS)  # this run's, maybe learned
+        self.learned = False  # the count came from what earlier downloads from its server taught
         self.removed = False  # taken off the list with the x key while it ran
         self.device: int | None = None  # the disk it is written to, for _check_space
         self.dir = opts.dir  # --dir, or the folder --sort picks for this kind of file
@@ -785,6 +800,8 @@ class Download:
             self.status = "paused"
             return
         self.final_url, self.total, self.ranges, server_name, self.validator, self.content_type = info
+        if self.ranges and getattr(self.opts, "learn_connections", False) and learning_on(self.opts):
+            self.connections, self.learned = choose_connections(server_of(self.final_url))
         if not self.custom_name:
             self.name = server_name
         self.kind = file_kind(self.name, self.content_type)
@@ -809,7 +826,8 @@ class Download:
             if not resumed and self.total:
                 f.truncate(self.total)
             self.status = "downloading"
-            connections = self.opts.connections if self.ranges else 1
+            started, done_before = time.monotonic(), self.done
+            connections = self.connections if self.ranges else 1
             workers = [threading.Thread(target=self._worker, args=(f.fileno(), stop, limiter), daemon=True)
                        for _ in range(connections)]
             for w in workers:
@@ -819,6 +837,11 @@ class Download:
                 self._save_state(state_path)
             if self.total is None and not self.failed.is_set() and not stop.is_set():
                 f.truncate(self.done)
+        if (self.ranges and not self.failed.is_set() and getattr(self.opts, "learn_connections", False)
+                and not (limiter.rate or self.opts.limit) and learning_on(self.opts)):
+            moved, took = self.done - done_before, time.monotonic() - started
+            if moved >= LEARN_MIN_BYTES and took >= LEARN_MIN_SECONDS:
+                learn_connections(server_of(self.final_url), self.connections, moved / took)
 
         if self.failed.is_set():
             self._save_state(state_path)
@@ -954,7 +977,7 @@ class Download:
         if not self.ranges or self.total is None:
             end = None if self.total is None else self.total - 1
             return [{"start": 0, "end": end, "done": 0}]
-        count = max(1, min(self.opts.connections, self.total // MIN_SPLIT))
+        count = max(1, min(self.connections, self.total // MIN_SPLIT))
         size = self.total // count
         return [{"start": i * size,
                  "end": self.total - 1 if i == count - 1 else (i + 1) * size - 1,
@@ -1559,8 +1582,9 @@ def add_network_options(parser: argparse.ArgumentParser) -> None:
 
 
 def add_download_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("-c", "--connections", type=int, default=DEFAULT_CONNECTIONS,
-                        help=f"connections per file, up to {MAX_CONNECTIONS} (default: {DEFAULT_CONNECTIONS})")
+    parser.add_argument("-c", "--connections", type=int,
+                        help=f"connections per file, up to {MAX_CONNECTIONS} (default: what suits each server, "
+                             f"learned from earlier downloads, starting at {DEFAULT_CONNECTIONS})")
     parser.add_argument("-j", "--jobs", type=int, default=3, help="files downloaded at once (default: 3)")
     parser.add_argument("-l", "--limit", type=parse_rate, metavar="RATE", help="total speed limit, e.g. 500K or 2M")
     parser.add_argument("-r", "--retries", type=int, default=10, help="retries per connection (default: 10)")
@@ -1614,6 +1638,10 @@ def check_network_options(parser: argparse.ArgumentParser, args) -> None:
 
 
 def check_download_options(parser: argparse.ArgumentParser, args) -> None:
+    # A count given, here or in mox config, is kept; without one, each server's is learned.
+    args.learn_connections = args.connections is None
+    if args.connections is None:
+        args.connections = DEFAULT_CONNECTIONS
     if not 1 <= args.connections <= MAX_CONNECTIONS:
         parser.error(f"--connections must be between 1 and {MAX_CONNECTIONS}")
     if args.jobs < 1:
@@ -2866,6 +2894,102 @@ def traffic_line(entries: list[dict]) -> str:
                                    for label, total in zip(labels, totals))
 
 
+def learned_path() -> str:
+    return os.path.join(os.path.dirname(history_path()), "learned.json")
+
+
+_learn_lock = threading.Lock()
+
+
+def learning_on(opts) -> bool:
+    """Learning keeps a record of servers and hours, so it is on when the history is."""
+    return bool(getattr(opts, "history", True)) and not history_disabled()
+
+
+def read_learned() -> dict:
+    try:
+        with open(learned_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_learned(data: dict) -> None:
+    """Through a temp file, so a crash midway leaves the old one. Failing costs only the lesson."""
+    path = learned_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".new", "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(path + ".new", path)
+    except OSError:
+        pass
+
+
+def server_of(url: str) -> str:
+    return (urllib.parse.urlsplit(url).hostname or "").lower()
+
+
+def choose_connections(host: str) -> tuple[int, bool]:
+    """How many connections to open to this server, and whether earlier downloads chose it.
+
+    A multi-armed bandit (UCB1): each count is an arm, its reward the speed it gave. Counts not
+    yet tried are tried first, the default first, so a server seen once costs nothing; after that
+    the best so far is used, and the others are tried again now and then, as servers change.
+    """
+    arms = read_learned().get("hosts", {}).get(host, {}).get("arms", {})
+    tried = {int(k): v for k, v in arms.items() if str(k).isdigit() and isinstance(v, list) and len(v) == 2}
+    untried = [n for n in LEARN_ARMS if n not in tried]
+    if untried:
+        return untried[0], bool(tried)
+    total = sum(count for count, _ in tried.values())
+    best = max(mean for _, mean in tried.values()) or 1.0
+    score = {n: mean / best + LEARN_EXPLORE * math.sqrt(2 * math.log(total) / count)
+             for n, (count, mean) in tried.items()}
+    return max(score, key=score.get), True
+
+
+def learn_connections(host: str, connections: int, speed: float) -> None:
+    """Teach the bandit what this count gave on this server."""
+    if not host or connections not in LEARN_ARMS:
+        return
+    with _learn_lock:
+        data = read_learned()
+        hosts = data.setdefault("hosts", {})
+        entry = hosts.setdefault(host, {"arms": {}})
+        count, mean = entry["arms"].get(str(connections), [0, 0.0])
+        count += 1
+        mean += (speed - mean) / min(count, LEARN_MEMORY)
+        entry["arms"][str(connections)] = [count, round(mean)]
+        entry["used"] = time.time()
+        if len(hosts) > LEARN_HOSTS:
+            for old in sorted(hosts, key=lambda h: hosts[h].get("used", 0))[:len(hosts) - LEARN_HOSTS]:
+                del hosts[old]
+        write_learned(data)
+
+
+def best_hours(hours: list) -> dict | None:
+    """The BEST_SPAN hours in a row that are usually fastest, if they are worth saying: known
+    for most of the day, and BEST_FACTOR times the usual speed or more. hours: [count, mean] x 24."""
+    known = [i for i, (count, _) in enumerate(hours) if count >= 3]
+    if len(known) < HOURS_KNOWN:
+        return None
+    usual = sum(hours[i][1] for i in known) / len(known)
+    spans = []
+    for start in range(24):
+        span = [(start + k) % 24 for k in range(BEST_SPAN)]
+        if all(h in known for h in span):
+            spans.append((sum(hours[h][1] for h in span) / BEST_SPAN, start))
+    if not spans or not usual:
+        return None
+    speed, start = max(spans)
+    if speed < BEST_FACTOR * usual:
+        return None
+    return {"from": f"{start:02d}:00", "until": f"{(start + BEST_SPAN) % 24:02d}:00",
+            "factor": round(speed / usual, 1)}
+
+
 def clean_headers(value) -> dict:
     """Request headers from a client, checked: names HTTP allows, values on one line. Anything
     else is refused, since a line break in a value would add a header of its own."""
@@ -3020,12 +3144,17 @@ class Engine:
                  links to web pages, as --watch does
       config     the saved settings, as a "config" event   config_set   key, value (null forgets it)
       history    limit: the last downloads and the traffic, as a "history" event
+      learned    what mox learned, as a "learned" event: hours (24 of [samples, bytes/s], the
+                 internet's usual speed at each hour), best (the usually fastest hours, worth
+                 suggesting, or null) and servers (how many it knows the best connections for)
+      forget     forget all of that, and start learning again
       quit       pause everything, save progress, and exit
     Events ({"type": ...}): hello (version, settings), state (version, downloads, speed, focus, jobs, limit,
     free: bytes free where downloads go, window, quota, today: bytes received today, gate: why
     nothing runs now, "schedule" or "quota", or null, slow, rate: the limit in force now, and
     why it is lower than limit, "slow" or "polite", or null, offline: seconds since the internet
-    went down, or null; about four times a second), added (ids), finished (id, status, name,
+    went down, or null, forecast: seconds until the queue is done, by the hours' usual speeds and
+    the window, or null; about four times a second), added (ids), finished (id, status, name,
     message), notice (text), clipboard (urls), config, history (also daily: bytes received on
     each of the last 30 days, oldest first), known (items), checked, check_done, error (text).
     A download waiting for disk space shows as "nospace", and starts again once there is room.
@@ -3056,6 +3185,11 @@ class Engine:
         self.lowered: str | None = None  # why the limit in force is below base_limit
         self.offline_since: float | None = None  # when the downloads found the internet down
         self.space_checked = 0.0  # when the downloads waiting for space last looked at the disk
+        # The internet's usual speed at each hour: 24 of [samples, bytes/s], kept in learned.json.
+        self.hours: list = self._read_hours()
+        self.hour_sampled = time.monotonic()
+        self.hours_saved = time.monotonic()
+        self.hours_changed = False
         # Today's traffic: what the history had for today when last counted, and how much of
         # limiter.used was in the history by then; see _received_today.
         self.today: tuple[datetime.date | None, int, int] = (None, 0, 0)
@@ -3095,6 +3229,7 @@ class Engine:
                     break
                 self._set_gate()
                 self._set_rate()
+                self._sample_hour()
                 self._retry_when_space()
                 self.queue.tick()
                 self._after_tick()
@@ -3109,6 +3244,7 @@ class Engine:
             self.queue.tick()
             time.sleep(0.1)
         self._record_traffic()
+        self._save_hours()
         self._save_list()
         self.emit(self.state())
 
@@ -3190,6 +3326,86 @@ class Engine:
             self._record_traffic()
             self.finished_since_idle = 0
 
+    # -- learning the hours
+
+    def _read_hours(self) -> list:
+        hours = read_learned().get("hours")
+        if isinstance(hours, list) and len(hours) == 24 and all(isinstance(h, list) and len(h) == 2 for h in hours):
+            return hours
+        return [[0, 0.0] for _ in range(24)]
+
+    def _sample_hour(self) -> None:
+        """Once a minute, while downloads run flat out, note the total speed under this hour.
+        Not while a limit holds them back, nor with one download alone, which may be the server's
+        limit rather than the internet's."""
+        if time.monotonic() - self.hour_sampled < HOUR_EVERY:
+            return
+        self.hour_sampled = time.monotonic()
+        running = [d for d in self.downloads if d.status == "downloading"]
+        if (len(running) < 2 and not any(d.active > 1 for d in running)) or self.limiter.rate or self.queue.gate:
+            return
+        if not learning_on(self.args):
+            return
+        speed = sum(d.speed() for d in running)
+        if speed <= 0:
+            return
+        slot = self.hours[datetime.datetime.now().hour]
+        slot[0] += 1
+        slot[1] = round(slot[1] + (speed - slot[1]) / min(slot[0], LEARN_MEMORY * 4))
+        self.hours_changed = True
+        if time.monotonic() - self.hours_saved >= HOUR_SAVE_EVERY:
+            self._save_hours()
+
+    def _save_hours(self) -> None:
+        if not self.hours_changed:
+            return
+        with _learn_lock:
+            data = read_learned()
+            data["hours"] = self.hours
+            write_learned(data)
+        self.hours_changed, self.hours_saved = False, time.monotonic()
+
+    def _forecast(self, described: list) -> int | None:
+        """Seconds until everything not paused is done: hour by hour at that hour's usual speed,
+        or now's where an hour has not been learned, and nothing outside the download window."""
+        going = [d for d in described if d["status"] not in ("done", "error", "held", "nospace")]
+        if not going or any(d["total"] is None for d in going):
+            return None
+        left = sum(d["total"] - d["done"] for d in going)
+        now_speed = sum(d["speed"] for d in going)
+        at, seconds = datetime.datetime.now(), 0.0
+        while left > 0 and seconds < 7 * 86400:
+            next_hour = (at + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            span = (next_hour - at).total_seconds()
+            count, usual = self.hours[at.hour]
+            speed = now_speed if seconds == 0 and now_speed else (usual if count >= 3 else now_speed)
+            if self.limiter.rate:
+                speed = min(speed, self.limiter.rate)
+            if self.window and not in_window(at, *self.window):
+                speed = 0
+            if speed <= 0 and not self.window:
+                return None  # nothing to go by
+            if speed * span >= left:
+                return round(seconds + left / speed)
+            left -= speed * span
+            seconds += span
+            at = next_hour
+        return None
+
+    def cmd_learned(self, c: dict) -> None:
+        servers = len(read_learned().get("hosts", {}))
+        self.emit({"type": "learned", "hours": self.hours, "best": best_hours(self.hours), "servers": servers,
+                   "enabled": learning_on(self.args)})
+
+    def cmd_forget(self, c: dict) -> None:
+        with _learn_lock:
+            try:
+                os.remove(learned_path())
+            except OSError:
+                pass
+        self.hours, self.hours_changed = [[0, 0.0] for _ in range(24)], False
+        self.cmd_learned(c)
+
     def _then(self, d: Download) -> None:
         """Move, open and run, as the download's then asks. A failure is told, and stops the rest."""
         try:
@@ -3258,7 +3474,8 @@ class Engine:
                 "quota": self.quota, "today": self._received_today(), "gate": self.queue.gate,
                 "slow": {"from": show_clock(self.slow[0])[:5], "until": show_clock(self.slow[1])[:5],
                          "limit": self.slow[2]} if self.slow else None,
-                "rate": self.limiter.rate, "lowered": self.lowered, "offline": self._offline()}
+                "rate": self.limiter.rate, "lowered": self.lowered, "offline": self._offline(),
+                "forecast": self._forecast(downloads)}
 
     def _offline(self) -> int | None:
         """Seconds since the downloads found the internet down, or None while it works."""
@@ -3310,6 +3527,7 @@ class Engine:
         return {"id": d.key, "url": d.url, "name": d.name, "status": status, "message": d.message, "done": d.done, "total": d.total, "speed": round(speed),
                 "eta": round(left) if left is not None else None, "connections": d.active, "kind": d.kind,
                 "path": d.path, "stream": d.stream, "ready": d.ready() if d.stream else None,
+                "learned": d.learned,
                 "pieces": coverage_map(d.pieces(), d.total, ENGINE_PIECES) if d.total else None,
                 "expired": d.error_status in EXPIRED_HTTP, "then": d.then}
 
@@ -3337,6 +3555,8 @@ class Engine:
 
     def cmd_add(self, c: dict) -> None:
         overrides = {key: c[key] for key in ("dir", "sort", "stream", "connections") if c.get(key) is not None}
+        if "connections" in overrides:
+            overrides["learn_connections"] = False  # asked for: kept, not learned
         extra = clean_headers(c.get("headers"))
         if extra:
             overrides["headers"] = {**self.args.headers, **extra}
