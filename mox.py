@@ -42,7 +42,7 @@ import wave
 from collections import deque
 from queue import Empty, Queue
 
-VERSION = "1.11"
+VERSION = "1.12"
 CHUNK = 256 * 1024
 MIN_SPLIT = 256 * 1024  # smallest piece when first dividing a file between connections
 MIN_STEAL = 64 * 1024   # smallest piece an idle connection takes over from a busy one
