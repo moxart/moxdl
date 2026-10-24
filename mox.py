@@ -18,6 +18,7 @@ import io
 import itertools
 import json
 import math
+import platform
 import mimetypes
 import os
 import re
@@ -28,6 +29,7 @@ import socket
 import ssl
 import struct
 import subprocess
+import tarfile
 import sys
 import threading
 import time
@@ -35,6 +37,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 import wave
 from collections import deque
 from queue import Empty, Queue
@@ -1831,6 +1834,12 @@ def parse_args(argv):
     parser.add_argument("-i", "--input", metavar="FILE", help="read URLs from FILE, one per line ('-' for stdin)")
     parser.add_argument("-d", "--dir", default=".", help="directory to save into (default: current)")
     parser.add_argument("-o", "--output", metavar="NAME", help="file name to save as (single URL only)")
+    parser.add_argument("--video", action="store_true",
+                        help="the links are pages of a video site, such as YouTube: download their video, with "
+                             "yt-dlp finding the streams and ffmpeg joining video and sound")
+    parser.add_argument("--quality", choices=MEDIA_QUALITIES, default="best", metavar="Q",
+                        help="with --video: the highest to take, 2160, 1440, 1080, 720, 480 or 360, best (the "
+                             "default), or audio for the sound alone")
     parser.add_argument("--sha256", metavar="HEX", help="verify the file against this checksum (single URL only)")
     parser.add_argument("--page", action="append", default=[], metavar="URL",
                         help="download the files a web page links to, such as a server's folder listing (repeatable)")
@@ -2843,7 +2852,7 @@ def record_history(d: Download) -> None:
     """Add one finished download to the history."""
     append_history({"time": datetime.datetime.now().isoformat(timespec="seconds"), "name": d.name,
                     "path": os.path.abspath(d.path), "size": d.done, "kind": d.kind,
-                    "url": link_without_secrets(d.url)})
+                    "url": getattr(d, "page", None) or link_without_secrets(d.url)})
 
 
 def record_traffic(received: int) -> None:
@@ -3124,10 +3133,17 @@ class Engine:
                  put them ahead of the queue,
                  then (see the then command), and skip_known: true to leave out files the
                  history has, still on disk, and report them in a "known" event instead
+      add also takes media: true, with quality (one of MEDIA_QUALITIES): the links are pages
+                 of a video site, downloaded as video through yt-dlp (see Media)
+      tools      what mox has for video sites, as a "tools" event: yt-dlp's version, the
+                 JavaScript runtime, ffmpeg
+      install    tool: "yt-dlp", "deno" or "ffmpeg": fetch its latest release into mox's own
+                 folder, checked against its published checksum; "tools" again when done
       then       id, then: {"open": true, "move": folder, "run": command}, what to do with
                  the file once done, in that order; the command gets the file's path last
       check      urls or text, and optionally dir: ask each server about its file without
-                 downloading, a "checked" event each, then "check_done" (free: bytes free in dir)
+                 downloading, a "checked" event each, then "check_done" (free: bytes free in dir);
+                 a page yt-dlp reads comes with media: title, duration and the qualities offered
       hold       id, on: pause one download (true) or let it carry on (false)
       hold_all   on: the same for every unfinished download
       next       id: download it next          move     id, to: put it at that place in the list
@@ -3258,7 +3274,8 @@ class Engine:
                 "connections": d.opts.connections, "held": d.held, "status": status, "path": d.path,
                 "size": d.total if d.total is not None else d.done, "kind": d.kind,
                 "message": d.message if status == "error" else "", "error_status": d.error_status,
-                "then": d.then, "headers": getattr(d.opts, "extra_headers", None) or {}}
+                "then": d.then, "headers": getattr(d.opts, "extra_headers", None) or {},
+                "media": {"quality": d.quality} if isinstance(d, Media) else None}
 
     def _save_list(self) -> None:
         if not getattr(self.args, "state", None):
@@ -3291,7 +3308,9 @@ class Engine:
                 opts = argparse.Namespace(**{**vars(self.args), "dir": entry["dir"], "sort": entry["sort"],
                                              "stream": entry["stream"], "connections": entry["connections"],
                                              "headers": {**self.args.headers, **extra}, "extra_headers": extra})
-                d = Download(entry["url"], opts, name=entry.get("name"))
+                media = entry.get("media")
+                d = (Media(entry["url"], opts, str(media.get("quality", "best")), entry.get("name"))
+                     if isinstance(media, dict) else Download(entry["url"], opts, name=entry.get("name")))
                 d.name, d.kind = entry.get("shown") or d.name, entry.get("kind") or d.kind
                 d.then = entry.get("then") or {}
                 if entry["status"] == "done":
@@ -3527,7 +3546,7 @@ class Engine:
         return {"id": d.key, "url": d.url, "name": d.name, "status": status, "message": d.message, "done": d.done, "total": d.total, "speed": round(speed),
                 "eta": round(left) if left is not None else None, "connections": d.active, "kind": d.kind,
                 "path": d.path, "stream": d.stream, "ready": d.ready() if d.stream else None,
-                "learned": d.learned,
+                "learned": d.learned, "media": isinstance(d, Media),
                 "pieces": coverage_map(d.pieces(), d.total, ENGINE_PIECES) if d.total else None,
                 "expired": d.error_status in EXPIRED_HTTP, "then": d.then}
 
@@ -3567,6 +3586,12 @@ class Engine:
         known = {file_link(d.url): d for d in self.downloads if d.status != "done"}
         have = self._known_files() if c.get("skip_known") else {}
         then = self._then_from(c.get("then"))
+        media = bool(c.get("media"))
+        quality = str(c.get("quality") or "best")
+        if media and quality not in MEDIA_QUALITIES:
+            raise ValueError(f"quality must be one of {', '.join(MEDIA_QUALITIES)}")
+        if media and not ytdlp_command():
+            raise ValueError("downloading from video sites needs yt-dlp: install it in Settings")
         skipped = []
         urls = list(c.get("urls") or [])
         for line in str(c.get("text") or "").splitlines():  # pasted text, read the way -i reads a file
@@ -3577,10 +3602,12 @@ class Engine:
         for url in urls:
             url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
             same = known.get(file_link(url))
-            if same is None and link_without_secrets(url) in have:
-                skipped.append({**have[link_without_secrets(url)], "url": url})
+            seen = url if media else link_without_secrets(url)  # a video's page is named by its whole link
+            if same is None and seen in have:
+                skipped.append({**have[seen], "url": url})
             elif same is None:
-                d = Download(url, opts, name=c.get("name") if len(urls) == 1 else None)
+                name = c.get("name") if len(urls) == 1 else None
+                d = Media(url, opts, quality, name) if media else Download(url, opts, name=name)
                 d.then = then
                 self.downloads.append(d)
                 known[file_link(url)] = d
@@ -3629,7 +3656,8 @@ class Engine:
                               "time": e.get("time"), "size": e.get("size")}
         for d in self.downloads:
             if d.status == "done" and d.path and os.path.exists(d.path):
-                found[link_without_secrets(d.url)] = {"name": d.name, "path": d.path, "time": None, "size": d.total}
+                found[getattr(d, "page", None) or link_without_secrets(d.url)] = {
+                    "name": d.name, "path": d.path, "time": None, "size": d.total}
         return found
 
     @staticmethod
@@ -3669,9 +3697,13 @@ class Engine:
                 except Empty:
                     return
                 try:
-                    _, total, ranges, name, _, _ = probe(unescape_link(url), self.args.headers, self.args.timeout)
-                    self.emit({"type": "checked", "url": url, "ok": True, "size": total, "name": name,
-                               "ranges": ranges})
+                    _, total, ranges, name, _, content_type = probe(unescape_link(url), self.args.headers,
+                                                                    self.args.timeout)
+                    answer = {"type": "checked", "url": url, "ok": True, "size": total, "name": name,
+                              "ranges": ranges}
+                    if content_type.startswith("text/html") and ytdlp_command():
+                        answer["media"] = self._media_check(url)
+                    self.emit(answer)
                 except (FatalError, *RETRYABLE_ERRORS) as e:
                     status = getattr(e, "status", None) or getattr(e, "code", None)
                     self.emit({"type": "checked", "url": url, "ok": False,
@@ -3692,6 +3724,37 @@ class Engine:
             self.emit({"type": "check_done", "count": len(urls), "free": free})
 
         threading.Thread(target=run, name="mox engine checks", daemon=True).start()
+
+    def _media_check(self, url: str) -> dict | None:
+        """A page as a video, if yt-dlp reads it: its title, length and the qualities on offer."""
+        try:
+            info = media_info(url, self.args)
+        except FatalError:
+            return None  # an ordinary page
+        if not _media_streams(info):
+            return None
+        return {"title": info.get("title"), "duration": info.get("duration"),
+                "qualities": media_qualities(info, ffmpeg_command() is not None)}
+
+    def cmd_tools(self, c: dict) -> None:
+        def look() -> None:
+            self.emit({"type": "tools", **tools_state()})
+        threading.Thread(target=look, name="mox engine tools", daemon=True).start()
+
+    def cmd_install(self, c: dict) -> None:
+        tool = str(c.get("tool"))
+        tool_source(tool)  # ValueError for a tool, or a system, there is nothing to fetch for
+
+        def fetch() -> None:
+            self.emit({"type": "notice", "text": f"fetching {tool}"})
+            try:
+                install_tool(tool, self.args, lambda done, total: self.emit(
+                    {"type": "installing", "tool": tool, "done": done, "total": total}))
+                self.emit({"type": "notice", "text": f"{tool} is ready"})
+            except (FatalError, ValueError, OSError, *RETRYABLE_ERRORS) as e:
+                self.emit({"type": "error", "text": f"could not fetch {tool}: {e}"})
+            self.emit({"type": "tools", **tools_state()})
+        threading.Thread(target=fetch, name="mox engine install", daemon=True).start()
 
     def cmd_hold(self, c: dict) -> None:
         d = self.find(c["id"])
@@ -3923,6 +3986,21 @@ def doctor_main(argv) -> int:
         "--watch and a plain 'mox' cannot read copied links",
         "" if clipboard else "install wl-clipboard (Wayland), xclip (X11) or termux-api (Termux)")
 
+    tools = tools_state()
+    ytdlp = tools["ytdlp"]["version"]
+    if ytdlp and tools["ytdlp"]["stale"]:
+        say("note", f"video sites: yt-dlp {ytdlp} is old, and sites such as YouTube change often",
+            "update it (yt-dlp -U, pipx upgrade yt-dlp), or fetch it in the desktop app's Settings")
+    else:
+        say("ok" if ytdlp else "note", f"video sites: yt-dlp {ytdlp}" if ytdlp else "no yt-dlp, so --video "
+            "cannot read video sites", "" if ytdlp else "the desktop app fetches it in Settings, or: pipx install yt-dlp")
+    if ytdlp:
+        say("ok" if tools["js"] else "note", f"JavaScript for YouTube: {tools['js']}" if tools["js"] else
+            "no JavaScript runtime, which yt-dlp needs for YouTube", "" if tools["js"] else "install deno or node")
+        say("ok" if tools["ffmpeg"] else "note", "ffmpeg, to join video and sound" if tools["ffmpeg"] else
+            "no ffmpeg, so videos come at the best quality that has sound in the same stream, often 360p",
+            "" if tools["ffmpeg"] else "install ffmpeg")
+
     sound = defaults.get("sound")
     sound = os.environ.get("MOX_SOUND", "") != "0" if sound is None else sound
     player = "winsound" if sys.platform == "win32" else next(
@@ -4009,6 +4087,455 @@ def download(url: str, directory: str = ".", *, name: str | None = None,
     return d.path
 
 
+# ---------------------------------------------------------------- video sites (yt-dlp)
+
+# yt-dlp reads a video site's page and finds its streams; mox downloads each stream over many
+# connections, as any file, and ffmpeg joins a video stream and a sound stream into one file.
+# None of the three is needed for anything else, so mox only looks for them when asked to.
+MEDIA_QUALITIES = ("best", "2160", "1440", "1080", "720", "480", "360", "audio")
+MEDIA_TIMEOUT = 120   # seconds yt-dlp may take to read a page
+MEDIA_REFRESHES = 3   # times a stream's link may be asked for afresh when it expires part way
+YTDLP_STALE_DAYS = 60  # older than this, a yt-dlp has often stopped working with YouTube
+DIRECT = ("http", "https")  # the streams mox downloads itself; others (HLS) go to yt-dlp
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0  # no console flashing up on Windows
+
+
+def tools_dir() -> str:
+    """Where mox keeps the helpers it fetched itself, beside the history."""
+    return os.path.join(os.path.dirname(history_path()), "tools")
+
+
+def _exe(name: str) -> str:
+    return name + ".exe" if os.name == "nt" else name
+
+
+def ytdlp_command() -> list | None:
+    """MOX_YTDLP, then mox's own copy, which it keeps current, then one on the PATH, then the module.
+    A copy from a system package goes out of date, and video sites change often."""
+    given = os.environ.get("MOX_YTDLP")
+    if given:
+        return shlex.split(given, posix=os.name != "nt")
+    own = os.path.join(tools_dir(), _exe("yt-dlp"))
+    if os.path.isfile(own):
+        return [own]
+    found = shutil.which("yt-dlp")
+    if found:
+        return [found]
+    if not getattr(sys, "frozen", False):
+        try:
+            import importlib.util
+            if importlib.util.find_spec("yt_dlp"):
+                return [sys.executable, "-m", "yt_dlp"]
+        except (ImportError, ValueError):
+            pass
+    return None
+
+
+def js_runtime() -> tuple[str | None, list]:
+    """The JavaScript runtime yt-dlp needs to read YouTube, and how to tell it: deno, which it
+    looks for itself, or mox's own deno, node or bun, which it is told of."""
+    own = os.path.join(tools_dir(), _exe("deno"))
+    if os.path.isfile(own):
+        return "deno", ["--js-runtimes", f"deno:{own}"]
+    if shutil.which("deno"):
+        return "deno", []
+    for name in ("node", "bun"):
+        path = shutil.which(name)
+        if path:
+            return name, ["--js-runtimes", f"{name}:{path}"]
+    return None, []
+
+
+def ffmpeg_command() -> str | None:
+    given = os.environ.get("MOX_FFMPEG")
+    if given:
+        return given
+    own = os.path.join(tools_dir(), _exe("ffmpeg"))
+    return own if os.path.isfile(own) else shutil.which("ffmpeg")
+
+
+def _ytdlp_args(opts, proxy: str | None) -> list:
+    command = ytdlp_command()
+    if not command:
+        raise FatalError("reading a video site needs yt-dlp; 'mox doctor' says how to get it")
+    args = [*command, "--no-update", "--no-warnings", *js_runtime()[1]]
+    if proxy:
+        args += ["--proxy", proxy]
+    ffmpeg = ffmpeg_command()
+    if ffmpeg:
+        args += ["--ffmpeg-location", ffmpeg]
+    return args
+
+
+def media_info(url: str, opts) -> dict:
+    """What yt-dlp says of a page: title, and every stream with its link and size. Tried through
+    --fallback-proxy too when the direct way fails, as YouTube is blocked in some countries."""
+    proxies = [getattr(opts, "proxy", None)]
+    if not proxies[0] and _fallback:
+        proxies.append(_fallback.url)
+    for proxy in proxies:
+        try:
+            result = subprocess.run(_ytdlp_args(opts, proxy) + ["-J", "--no-playlist", url], capture_output=True,
+                                    text=True, encoding="utf-8", errors="replace", timeout=MEDIA_TIMEOUT,
+                                    stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            message = "the video site took too long to answer"
+            continue
+        except OSError as e:
+            raise FatalError(f"could not run yt-dlp: {e}") from None
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                return json.loads(result.stdout)
+            except ValueError:
+                message = "yt-dlp said something mox could not read"
+                continue
+        lines = [line for line in result.stderr.splitlines() if line.strip()]
+        message = (lines[-1] if lines else f"yt-dlp exited with {result.returncode}").replace("ERROR: ", "")
+    raise FatalError(message[:300])
+
+
+def _media_streams(info: dict) -> list:
+    formats = info.get("formats") or ([info] if info.get("url") else [])
+    return [f for f in formats if f.get("url") and "drc" not in str(f.get("format_id", ""))]  # drc: squeezed sound
+
+
+def _has(f: dict, kind: str) -> bool:
+    return f.get(kind) not in (None, "none")
+
+
+def _stream_size(f: dict) -> int:
+    return int(f.get("filesize") or f.get("filesize_approx") or 0)
+
+
+def pick_formats(info: dict, quality: str, can_join: bool) -> tuple[list, str]:
+    """The streams for a quality, and the file's extension: the best video up to that height and
+    the best sound, to join, or one stream with both when they cannot be joined (no ffmpeg).
+    H.264 in MP4 is preferred at a height, since every player plays it. [] when no stream is one
+    mox can download itself (HLS and such): yt-dlp downloads those."""
+    direct = [f for f in _media_streams(info) if f.get("protocol", "https") in DIRECT]
+    sound = [f for f in direct if _has(f, "acodec") and not _has(f, "vcodec")]
+    video = [f for f in direct if _has(f, "vcodec") and not _has(f, "acodec")]
+    both = [f for f in direct if _has(f, "vcodec") and _has(f, "acodec")]
+    cap = None if quality in ("best", "audio") else int(quality)
+
+    def fits(f):
+        return cap is None or (f.get("height") or 0) <= cap
+
+    def video_rank(f):
+        return (f.get("height") or 0, str(f.get("vcodec", "")).startswith("avc1"), f.get("ext") == "mp4",
+                f.get("tbr") or 0)
+
+    def sound_rank(f):
+        return (f.get("ext") == "m4a", f.get("abr") or f.get("tbr") or 0)
+
+    if quality == "audio":
+        if sound:
+            best = max(sound, key=sound_rank)
+            return [best], best.get("ext") or "m4a"
+        return [], ""
+    if can_join and sound and any(fits(f) for f in video):
+        v = max((f for f in video if fits(f)), key=video_rank)
+        same = [f for f in sound if (f.get("ext") == "m4a") == (v.get("ext") == "mp4")] or sound
+        a = max(same, key=sound_rank)
+        whole = [f for f in both if fits(f)]
+        if whole and (max(whole, key=video_rank).get("height") or 0) >= (v.get("height") or 0):
+            best = max(whole, key=video_rank)  # one stream as good: nothing to join
+            return [best], best.get("ext") or "mp4"
+        ext = "mp4" if (v.get("ext"), a.get("ext")) == ("mp4", "m4a") else \
+              "webm" if (v.get("ext"), a.get("ext")) == ("webm", "webm") else "mkv"
+        return [v, a], ext
+    whole = [f for f in both if fits(f)] or both
+    if whole:
+        best = max(whole, key=video_rank)
+        return [best], best.get("ext") or "mp4"
+    return [], ""
+
+
+def media_qualities(info: dict, can_join: bool) -> list:
+    """The qualities a page offers, best first, each with its height and size, for a picker."""
+    offered, seen = [], set()
+    for quality in MEDIA_QUALITIES[1:-1]:
+        streams, _ = pick_formats(info, quality, can_join)
+        height = streams[0].get("height") if streams else None
+        if height and height not in seen:
+            seen.add(height)
+            offered.append({"quality": str(height) if str(height) in MEDIA_QUALITIES else quality,
+                            "height": height, "size": sum(_stream_size(f) for f in streams) or None,
+                            "join": len(streams) > 1})
+    streams, ext = pick_formats(info, "audio", can_join)
+    if streams:
+        offered.append({"quality": "audio", "height": None, "size": _stream_size(streams[0]) or None,
+                        "join": False, "ext": ext})
+    return offered
+
+
+class Media(Download):
+    """A video from a site yt-dlp reads, such as YouTube: yt-dlp finds its streams, mox downloads
+    each over many connections, as any file, then ffmpeg joins video and sound. The list shows it
+    as one download; its streams sit beside it as Title.f137.mp4 until joined.
+
+    A stream's link expires after some hours. When one does part way, the page is asked again for
+    a fresh link to the same stream, and the stream carries on from where it was."""
+
+    def __init__(self, page: str, opts, quality: str = "best", name: str | None = None):
+        super().__init__(page, opts, name=name)
+        self.page, self.quality = page, quality if quality in MEDIA_QUALITIES else "best"
+        self.stream = False
+        self.kind = "audio" if self.quality == "audio" else "video"
+        if not name:
+            self.name = urllib.parse.urlsplit(page).hostname or page  # until the site says the title
+        self.part: Download | None = None  # the stream downloading now
+        self.part_sizes: list[int] = []
+        self.part_index = 0
+
+    def restart(self) -> Media:
+        fresh = Media(self.page, self.opts, self.quality, self.custom_name)
+        fresh.key, fresh.dir, fresh.held, fresh.then = self.key, self.dir, self.held, self.then
+        return fresh
+
+    def pieces(self) -> list[tuple[int, int]]:
+        out, offset = [], 0
+        for i, size in enumerate(self.part_sizes):
+            if i < self.part_index:
+                out.append((offset, size))
+            elif i == self.part_index and self.part:
+                out += [(offset + start, done) for start, done in self.part.pieces()]
+            offset += size
+        return out
+
+    def _run(self, stop, limiter):
+        self.status, self.message = "connecting", "asking the site"
+        info = media_info(self.page, self.opts)
+        # A title is a name, not a path: "AC/DC - Live" keeps both its halves.
+        title = safe_name(re.sub(r"[/\\]", "_", info.get("title") or "")) or "video"
+        streams, ext = pick_formats(info, self.quality, ffmpeg_command() is not None)
+        if not self.custom_name:
+            self.name = f"{title}.{ext or ('m4a' if self.quality == 'audio' else 'mp4')}"
+        if getattr(self.opts, "sort", False):
+            self.dir = self._sorted_dir()
+        self.path = self._choose_path()
+        self.name = os.path.basename(self.path)
+        if not streams:
+            return self._run_with_ytdlp(stop)
+        self.part_sizes = [_stream_size(f) for f in streams]
+        self.total = sum(self.part_sizes) or None
+        stem = os.path.splitext(os.path.basename(self.path))[0]
+        files = []
+        for i, f in enumerate(streams):
+            self.part_index = i
+            got = self._get_stream(f, f"{stem}.f{f.get('format_id')}.{f.get('ext') or 'bin'}", stop, limiter)
+            if got is None:
+                self.status = "paused"
+                return
+            files.append(got)
+            self.part_sizes[i] = os.path.getsize(got)
+        self.part_index, self.part = len(streams), None
+        self._join(files)
+        self.done = self.total = os.path.getsize(self.path)
+        self.status, self.message = "done", ""
+        if getattr(self.opts, "history", False):
+            record_history(self)
+
+    def _get_stream(self, f: dict, name: str, stop, limiter) -> str | None:
+        """One stream, downloaded as any file; its path, or None if paused."""
+        url, headers, refreshed = f["url"], f.get("http_headers") or {}, 0
+        before = sum(self.part_sizes[:self.part_index])
+        while True:
+            opts = argparse.Namespace(**{**vars(self.opts), "headers": {**self.opts.headers, **headers},
+                                         "sort": False, "stream": False, "history": False})
+            part = self.part = Download(url, opts, name=name)
+            part.dir = self.dir
+            worker = threading.Thread(target=part.run, args=(stop, limiter), daemon=True)
+            worker.start()
+            while worker.is_alive():
+                worker.join(FRAME_INTERVAL)
+                if part.total:
+                    self.part_sizes[self.part_index] = part.total
+                    self.total = sum(self.part_sizes)
+                self.done, self.active = before + part.done, part.active
+                self.connections, self.learned = part.connections, part.learned
+                self.status = "downloading" if part.status == "downloading" else self.status
+                self.message = part.message if part.status != "downloading" or part.message else ""
+            if part.status == "done":
+                return part.path
+            if stop.is_set() or part.status == "paused":
+                return None
+            if part.error_status in EXPIRED_HTTP and refreshed < MEDIA_REFRESHES:
+                refreshed += 1
+                self.status, self.message = "connecting", "the link expired: asking the site again"
+                fresh = next((g for g in _media_streams(media_info(self.page, self.opts))
+                              if g.get("format_id") == f.get("format_id")), None)
+                if fresh is None:
+                    raise FatalError("the site no longer offers this quality")
+                url, headers = fresh["url"], fresh.get("http_headers") or {}
+                continue
+            raise FatalError(part.message or "a stream failed", part.error_status)
+
+    def _join(self, files: list) -> None:
+        """One file from the streams: renamed when there is one, joined by ffmpeg when two."""
+        self.path = self._keep_free(self.path)
+        if len(files) == 1:
+            os.replace(files[0], self.path)
+            return
+        self.status, self.message = "verifying", "joining video and sound"
+        ffmpeg = ffmpeg_command()
+        if not ffmpeg:
+            raise FatalError("joining video and sound needs ffmpeg; 'mox doctor' says how to get it")
+        joined = self.path + PART_SUFFIX
+        form = {".mp4": "mp4", ".m4a": "mp4", ".webm": "webm"}.get(os.path.splitext(self.path)[1], "matroska")
+        result = subprocess.run([ffmpeg, "-v", "error", "-nostdin", "-y", "-i", files[0], "-i", files[1],
+                                 "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-f", form, joined],
+                                capture_output=True, text=True, errors="replace", creationflags=NO_WINDOW)
+        if result.returncode != 0:
+            self._remove(joined)
+            lines = [line for line in result.stderr.splitlines() if line.strip()]
+            raise FatalError(f"ffmpeg could not join them: {lines[-1] if lines else result.returncode}")
+        os.replace(joined, self.path)
+        for path in files:
+            self._remove(path)
+
+    def _run_with_ytdlp(self, stop) -> None:
+        """Streams mox cannot download itself, such as HLS: yt-dlp downloads them, many pieces
+        at once, and mox follows its progress. Stopped, it keeps its .part to carry on from."""
+        height = "" if self.quality in ("best", "audio") else f"[height<={self.quality}]"
+        pick = "ba/b" if self.quality == "audio" else f"bv*{height}+ba/b{height}/b"
+        args = _ytdlp_args(self.opts, getattr(self.opts, "proxy", None) or (_fallback.url if _fallback else None))
+        template = ("download:mox %(progress.downloaded_bytes)s %(progress.total_bytes)s "
+                    "%(progress.total_bytes_estimate)s")
+        process = subprocess.Popen(args + ["-f", pick, "-N", "8", "--no-playlist", "--newline", "-o", self.path,
+                                          "--progress-template", template, self.page],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                   text=True, errors="replace", creationflags=NO_WINDOW)
+        self.status, self.message = "downloading", ""
+        errors: list[str] = []
+        threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True).start()
+        for line in process.stdout:
+            if stop.is_set():
+                process.terminate()
+                break
+            words = line.split()
+            if words[:1] == ["mox"] and len(words) == 4:
+                numbers = [int(float(w)) if w not in ("NA", "None") else None for w in words[1:]]
+                self.done = numbers[0] or self.done
+                self.total = numbers[1] or numbers[2] or self.total
+        process.wait()
+        if stop.is_set():
+            self.status = "paused"
+            return
+        if process.returncode != 0 or not os.path.exists(self.path):
+            message = next((e.strip() for e in reversed(errors) if e.strip()), f"yt-dlp exited with {process.returncode}")
+            raise FatalError(message.replace("ERROR: ", "")[:300])
+        self.done = self.total = os.path.getsize(self.path)
+        self.status = "done"
+        if getattr(self.opts, "history", False):
+            record_history(self)
+
+
+# What mox can fetch for itself, from each project's own releases, checked against the checksums
+# published beside them: (download folder, file, checksum file, what to take out of an archive).
+TOOL_BASES = {
+    "yt-dlp": "https://github.com/yt-dlp/yt-dlp/releases/latest/download/",
+    "deno": "https://github.com/denoland/deno/releases/latest/download/",
+    "ffmpeg": "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/",
+}
+
+
+def tool_source(tool: str) -> tuple[str, str, str | None]:
+    """(file, checksum file, file inside its archive) for this machine, or ValueError."""
+    machine = platform.machine().lower()
+    arm = machine in ("arm64", "aarch64")
+    system = sys.platform
+    if tool == "yt-dlp":
+        name = ("yt-dlp.exe" if system == "win32" else "yt-dlp_macos" if system == "darwin"
+                else "yt-dlp_linux_aarch64" if arm else "yt-dlp_linux")
+        return name, "SHA2-256SUMS", None
+    if tool == "deno":
+        target = {"win32": "pc-windows-msvc", "darwin": "apple-darwin"}.get(system, "unknown-linux-gnu")
+        name = f"deno-{'aarch64' if arm else 'x86_64'}-{target}.zip"
+        return name, name + ".sha256sum", _exe("deno")
+    if tool == "ffmpeg":
+        if system == "darwin":
+            raise ValueError("on a Mac, install ffmpeg with Homebrew: brew install ffmpeg")
+        name = ("ffmpeg-master-latest-win64-gpl.zip" if system == "win32" else
+                f"ffmpeg-master-latest-{'linuxarm64' if arm else 'linux64'}-gpl.tar.xz")
+        return name, "checksums.sha256", _exe("ffmpeg")
+    raise ValueError(f"no such tool: {tool}")
+
+
+def install_tool(tool: str, opts, progress=None) -> str:
+    """Fetch a tool's latest release into tools_dir(), check it, and return its path."""
+    name, sums, inside = tool_source(tool)
+    base = TOOL_BASES[tool]
+    folder = tools_dir()
+    os.makedirs(folder, exist_ok=True)
+    with request(base + sums, opts.headers, opts.timeout) as resp:
+        published = resp.read().decode("utf-8", "replace")
+    # Each project lists "<sha256>  <file>", one a line.
+    expected = next((line.split()[0].lower() for line in published.splitlines()
+                     if len(line.split()) == 2 and line.split()[1].lstrip("*") == name), None)
+    if not expected or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise FatalError(f"no checksum for {name} in {sums}")
+    fetch_opts = argparse.Namespace(**{**vars(opts), "dir": folder, "sort": False, "stream": False,
+                                       "history": False, "learn_connections": False})
+    d = Download(base + name, fetch_opts, name=name + ".download", sha256=expected)
+    stop = threading.Event()
+    worker = threading.Thread(target=d.run, args=(stop, RateLimiter(None)), daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(FRAME_INTERVAL)
+        if progress:
+            progress(d.done, d.total)
+    if d.status != "done":
+        raise FatalError(f"{name}: {d.message or d.status}")
+    target = os.path.join(folder, _exe(tool))
+    try:
+        if inside is None:
+            os.replace(d.path, target + ".new")
+        elif name.endswith(".zip"):
+            with zipfile.ZipFile(d.path) as archive:
+                member = next(m for m in archive.namelist() if m.rsplit("/", 1)[-1] == inside)
+                with archive.open(member) as src, open(target + ".new", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        else:
+            with tarfile.open(d.path) as archive:
+                member = next(m for m in archive.getmembers() if m.isfile() and m.name.rsplit("/", 1)[-1] == inside)
+                with archive.extractfile(member) as src, open(target + ".new", "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    except StopIteration:
+        raise FatalError(f"{name} has no {inside} in it") from None
+    finally:
+        if inside is not None and os.path.exists(d.path):
+            os.remove(d.path)
+    os.chmod(target + ".new", 0o755)
+    os.replace(target + ".new", target)
+    return target
+
+
+def tools_state() -> dict:
+    """What mox has of the helpers for video sites, for mox doctor and the desktop app."""
+    command = ytdlp_command()
+    version = None
+    if command:
+        try:
+            version = subprocess.run(command + ["--version"], capture_output=True, text=True, timeout=30,
+                                     stdin=subprocess.DEVNULL, creationflags=NO_WINDOW).stdout.strip() or None
+        except (OSError, subprocess.TimeoutExpired):
+            version = None
+    own = os.path.join(tools_dir(), _exe("yt-dlp"))
+    runtime, _ = js_runtime()
+    ffmpeg = ffmpeg_command()
+    # yt-dlp is versioned by its release date: 2026.10.21
+    try:
+        released = datetime.date(*map(int, (version or "").split(".")[:3]))
+        stale = (datetime.date.today() - released).days > YTDLP_STALE_DAYS
+    except (TypeError, ValueError):
+        stale = False
+    return {"ytdlp": {"version": version, "own": bool(command) and command[0] == own, "stale": stale},
+            "js": runtime, "ffmpeg": bool(ffmpeg),
+            "ffmpeg_own": bool(ffmpeg) and ffmpeg == os.path.join(tools_dir(), _exe("ffmpeg")),
+            "can_install_ffmpeg": sys.platform != "darwin"}
+
+
 # ---------------------------------------------------------------- main
 
 def main(argv=None) -> int:
@@ -4047,7 +4574,11 @@ def run_command(argv) -> int:
             print(f"✖ {page} links to no files{matching}.", file=sys.stderr)
             return 1
         args.urls = list(dict.fromkeys(args.urls + found))
-    downloads = [Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
+    if args.video and not ytdlp_command():
+        print("✖ --video needs yt-dlp: 'mox doctor' says how to get it", file=sys.stderr)
+        return 2
+    downloads = [Media(url, args, args.quality, name=args.output) if args.video else
+                 Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
     if not args.watch:
         return run_downloads(downloads, args)
     command = clipboard_command()

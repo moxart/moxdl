@@ -168,6 +168,18 @@ If every slot is taken (`-j`, 3 by default), the lowest download in the list pau
 
 mox normally fetches pieces from all over a file at once, so a video cannot play until it has all arrived. `--stream`, or `w` on a selected download, fills the file from the start instead. Its icon turns to ▶, and once the first 32 MB are in, the status line says how far the `.part` file can be played. Open it in mpv or VLC and watch while the rest comes in. Press `f` too for all the speed. Seeking ahead of what has arrived does not work, and some files keep their seek index at the end.
 
+### Videos from YouTube and other sites
+
+```bash
+mox --video https://www.youtube.com/watch?v=...
+mox --video --quality 720 https://www.aparat.com/v/...
+mox --video --quality audio https://www.youtube.com/watch?v=...   # the sound alone
+```
+
+yt-dlp reads the page and finds the video's streams, for YouTube and about 1800 other sites; mox downloads each stream over many connections, so it is quicker than a single one, resumes, and keeps to `--limit`, `--at` and the rest; then ffmpeg joins the video and the sound into one file. The best quality is taken unless `--quality` caps it, and H.264 in MP4 is preferred at a given height, as every player plays it. When a stream's link expires part way, as YouTube's do after some hours, mox asks the page again and carries on.
+
+It needs [yt-dlp](https://github.com/yt-dlp/yt-dlp), recent, since sites change often; for YouTube, a JavaScript runtime ([Deno](https://deno.com) or Node); and ffmpeg for anything better than the one stream that has both video and sound, often 360p. `mox doctor` says what is there and what is old. The desktop app fetches all three in its Settings.
+
 ### Copy a link, get the file
 
 ```bash
@@ -328,6 +340,8 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `-s, --sort` | | Save each kind of file in its own folder |
 | `--sort-root NAME` | mox | The folder in `--dir` that `--sort` fills, `.` for `--dir` itself |
 | `--stream` | | Fill files from the start, to watch while they download |
+| `--video` | | The links are pages of a video site, such as YouTube: download the video, through yt-dlp and ffmpeg |
+| `--quality Q` | best | With `--video`: 2160, 1440, 1080, 720, 480, 360, best, or audio for the sound alone |
 | `-q, --quota SIZE` | none | Pause after this much, such as `5G` |
 | `--then ACTION` | | `shutdown` or `sleep` when the downloads end |
 | `-n, --notify` | | Desktop or Telegram notification when done |

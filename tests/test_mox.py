@@ -170,6 +170,41 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+# Stand-ins for yt-dlp and ffmpeg, so the video-site code runs without the network. The fake
+# yt-dlp describes any page as a video whose streams are this server's files: FAKE_STREAMS (JSON)
+# chooses them, and a count in FAKE_CALLS lets a test serve a different answer the second time.
+FAKE_YTDLP = r"""
+import json, os, sys
+args = sys.argv[1:]
+if "--version" in args:
+    print("2099.01.01")
+    sys.exit(0)
+calls = os.environ.get("FAKE_CALLS")
+n = 0
+if calls:
+    n = int(open(calls).read() or 0) if os.path.exists(calls) else 0
+    open(calls, "w").write(str(n + 1))
+if "-J" in args:
+    streams = json.loads(os.environ["FAKE_STREAMS"])
+    if n and os.environ.get("FAKE_STREAMS_AFTER"):
+        streams = json.loads(os.environ["FAKE_STREAMS_AFTER"])
+    print(json.dumps({"title": "Clip: one/two", "duration": 3, "formats": streams}))
+elif "-o" in args:  # downloading itself, as for HLS
+    with open(args[args.index("-o") + 1], "wb") as f:
+        f.write(b"x" * 1000)
+    print("mox 1000 1000 NA", flush=True)
+"""
+# Joins as ffmpeg would: the two inputs, one after the other, into the last argument.
+FAKE_FFMPEG = r"""
+import sys
+args = sys.argv[1:]
+inputs = [args[i + 1] for i, a in enumerate(args) if a == "-i"]
+with open(args[-1], "wb") as out:
+    for name in inputs:
+        out.write(open(name, "rb").read())
+"""
+
+
 class QuietServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         pass  # mox drops connections on purpose; the resets are expected
@@ -1603,6 +1638,110 @@ class MoxTest(unittest.TestCase):
         state = wait_for("state", lambda e: e["downloads"] and e["downloads"][0]["status"] == "downloading"
                          and e["downloads"][0]["speed"] > 0)
         self.assertGreater(state["forecast"], 0)
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    def fake_video_tools(self, streams, after=None):
+        """Point mox at the fake yt-dlp and ffmpeg, describing pages with these streams."""
+        tools = self.temp_dir("mox-tools-")
+        for name, code in (("yt-dlp.py", FAKE_YTDLP), ("ffmpeg.py", FAKE_FFMPEG)):
+            with open(os.path.join(tools, name), "w") as f:
+                f.write(code)
+        for name, value in (("MOX_YTDLP", f"{sys.executable} {os.path.join(tools, 'yt-dlp.py')}"),
+                            ("MOX_FFMPEG", f"{os.path.join(tools, 'ffmpeg')}"),
+                            ("FAKE_STREAMS", json.dumps(streams)),
+                            ("FAKE_STREAMS_AFTER", json.dumps(after) if after else None),
+                            ("FAKE_CALLS", os.path.join(tools, "calls"))):
+            self.addCleanup(restore_env, name, os.environ.get(name))
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        # MOX_FFMPEG names one program: a small script that runs the fake with Python.
+        launcher = os.path.join(tools, "ffmpeg")
+        with open(launcher, "w") as f:
+            f.write(f"#!/bin/sh\nexec {sys.executable} {os.path.join(tools, 'ffmpeg.py')} \"$@\"\n")
+        os.chmod(launcher, 0o755)
+
+    def streams(self, video="big.bin", audio="alt/big.bin", both="short/big.bin"):
+        return [{"format_id": "137", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 720,
+                 "protocol": "https", "url": f"{self.base}/{video}", "filesize": SIZE},
+                {"format_id": "140", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 128,
+                 "protocol": "https", "url": f"{self.base}/{audio}", "filesize": SIZE},
+                {"format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "height": 360,
+                 "protocol": "https", "url": f"{self.base}/{both}", "filesize": SIZE}]
+
+    @unittest.skipIf(os.name == "nt", "the fake ffmpeg is a shell script")
+    def test_video_from_a_site(self):
+        self.fake_video_tools(self.streams())
+        # 720: the video and sound streams, each downloaded, then joined; nothing else left.
+        self.assertEqual(self.mox("--video", "--quality", "720", f"{self.base}/watch?v=1").returncode, 0)
+        joined = os.path.join(self.out, "Clip_ one_two.mp4")
+        self.assertEqual(sorted(os.listdir(self.out)), ["Clip_ one_two.mp4"])
+        self.assertEqual(os.path.getsize(joined), 2 * SIZE)
+        # 360: the one stream that has both, as it is.
+        out = self.temp_dir("mox-360-")
+        self.assertEqual(self.mox("--video", "--quality", "360", "-d", out, f"{self.base}/watch?v=1").returncode, 0)
+        self.assertEqual(sha256(os.path.join(out, "Clip_ one_two.mp4")), self.digest)
+        # audio: the sound alone.
+        out = self.temp_dir("mox-audio-")
+        self.assertEqual(self.mox("--video", "--quality", "audio", "-d", out, f"{self.base}/watch?v=1").returncode, 0)
+        self.assertEqual(os.listdir(out), ["Clip_ one_two.m4a"])
+
+    @unittest.skipIf(os.name == "nt", "the fake ffmpeg is a shell script")
+    def test_video_link_expires_part_way(self):
+        # The first answer's video link is gone, as one expires overnight; the page is asked again.
+        self.fake_video_tools(self.streams(video="gone/big.bin"), after=self.streams())
+        result = self.mox("--video", "--quality", "720", f"{self.base}/watch?v=2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.path.getsize(os.path.join(self.out, "Clip_ one_two.mp4")), 2 * SIZE)
+
+    def test_video_streams_ytdlp_downloads_itself(self):
+        # HLS and such: yt-dlp downloads it, and mox follows.
+        self.fake_video_tools([{"format_id": "hls-720", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a",
+                                "height": 720, "protocol": "m3u8_native", "url": f"{self.base}/x.m3u8"}])
+        self.assertEqual(self.mox("--video", f"{self.base}/watch?v=3").returncode, 0)
+        self.assertEqual(os.path.getsize(os.path.join(self.out, "Clip_ one_two.mp4")), 1000)
+
+    def test_pick_formats(self):
+        mox = load_mox()
+        info = {"formats": self.streams() + [
+            {"format_id": "248", "ext": "webm", "vcodec": "vp9", "acodec": "none", "height": 1080,
+             "protocol": "https", "url": "x"},
+            {"format_id": "140-drc", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 999,
+             "protocol": "https", "url": "x"}]}
+        ids = lambda q, join=True: [f["format_id"] for f in mox.pick_formats(info, q, join)[0]]
+        self.assertEqual(ids("best"), ["248", "140"])   # the highest, and never the squeezed drc sound
+        self.assertEqual(mox.pick_formats(info, "best", True)[1], "mkv")  # webm and m4a: Matroska holds both
+        self.assertEqual(ids("720"), ["137", "140"])
+        self.assertEqual(ids("360"), ["18"])            # the one stream with both is as good: no join
+        self.assertEqual(ids("1080", join=False), ["18"])  # without ffmpeg, only a stream with both
+        self.assertEqual(ids("audio"), ["140"])
+        qualities = [q["quality"] for q in mox.media_qualities(info, True)]
+        self.assertEqual(qualities, ["1080", "720", "360", "audio"])
+
+    @unittest.skipIf(os.name == "nt", "the fake ffmpeg is a shell script")
+    def test_engine_video_sites(self):
+        self.fake_video_tools(self.streams())
+        proc, send, wait_for = self.start_engine()
+        send(cmd="tools")
+        tools = wait_for("tools")
+        self.assertEqual((tools["ytdlp"]["version"], tools["ytdlp"]["stale"], tools["ffmpeg"]), ("2099.01.01", False, True))
+        # A page: check says it is a video, and what qualities it offers.
+        send(cmd="check", urls=[f"{self.base}/index/"])
+        checked = wait_for("checked")
+        self.assertEqual(checked["media"]["title"], "Clip: one/two")
+        self.assertEqual([q["quality"] for q in checked["media"]["qualities"]], ["720", "360", "audio"])
+        send(cmd="add", urls=[f"{self.base}/watch?v=9"], media=True, quality="720")
+        page = wait_for("added")["ids"][0]
+        done = wait_for("finished", lambda e: e["id"] == page)
+        self.assertEqual((done["status"], done["name"]), ("done", "Clip_ one_two.mp4"))
+        row = wait_for("state")["downloads"][0]
+        self.assertEqual((row["media"], row["total"], row["kind"]), (True, 2 * SIZE, "video"))
+        send(cmd="add", urls=[f"{self.base}/watch?v=9"], media=True, quality="1")
+        self.assertIn("quality must be", wait_for("error")["text"])
+        send(cmd="install", tool="nothing")
+        self.assertIn("no such tool", wait_for("error")["text"])
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
