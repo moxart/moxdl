@@ -284,6 +284,8 @@ mox --fallback-proxy socks5://127.0.0.1:1080 -i links.txt
 
 `auto` looks for a SOCKS5 proxy on this computer, on the ports v2rayN, xray, Clash, NekoRay and Tor use. Direct here really means direct: the `http_proxy` variables, which proxy apps often set for the whole system, are ignored, and a server switches to the proxy after its first failed connection.
 
+`mox engine`, which the desktop app runs, does this by itself when no proxy is set: a blocked site, YouTube among them, works without a setting, and a proxy app started later is found on the next failure.
+
 ### A whole folder
 
 ```bash

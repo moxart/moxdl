@@ -368,9 +368,27 @@ def proxied(url: str) -> bool:
     return _fallback is not None and host_of(url) in _proxied_hosts
 
 
+# mox engine looks for a proxy app by itself (see enable_auto_fallback), and again when a server
+# cannot be reached and none was found yet: the app may have been started since.
+_fallback_auto = False
+_fallback_looked = 0.0
+FALLBACK_LOOK_EVERY = 60  # seconds between looks for a proxy app that was not there
+
+
+def enable_auto_fallback() -> None:
+    """--fallback-proxy auto, quietly, and looked for again later if there is none now."""
+    global _fallback_auto, _fallback_looked
+    _fallback_auto, _fallback_looked = True, time.monotonic()
+    configure_fallback(find_local_proxy())
+
+
 def use_fallback(url: str) -> bool:
     """Send this server through --fallback-proxy from now on. False when there is none, or it already is."""
+    global _fallback_looked
     with _proxied_lock:
+        if _fallback is None and _fallback_auto and time.monotonic() - _fallback_looked >= FALLBACK_LOOK_EVERY:
+            _fallback_looked = time.monotonic()
+            configure_fallback(find_local_proxy())
         if _fallback is None or host_of(url) in _proxied_hosts:
             return False
         _proxied_hosts.add(host_of(url))
@@ -3697,14 +3715,19 @@ class Engine:
                 except Empty:
                     return
                 try:
-                    _, total, ranges, name, _, content_type = probe(unescape_link(url), self.args.headers,
-                                                                    self.args.timeout)
+                    _, total, ranges, name, _, content_type = self._probe_once(url)
                     answer = {"type": "checked", "url": url, "ok": True, "size": total, "name": name,
                               "ranges": ranges}
                     if content_type.startswith("text/html") and ytdlp_command():
                         answer["media"] = self._media_check(url)
                     self.emit(answer)
                 except (FatalError, *RETRYABLE_ERRORS) as e:
+                    # A video site may refuse a plain request and still answer yt-dlp.
+                    media = self._media_check(url) if ytdlp_command() else None
+                    if media:
+                        self.emit({"type": "checked", "url": url, "ok": True, "size": None, "name": None,
+                                   "ranges": False, "media": media})
+                        continue
                     status = getattr(e, "status", None) or getattr(e, "code", None)
                     self.emit({"type": "checked", "url": url, "ok": False,
                                "message": str(e) if isinstance(e, FatalError) else reason(e),
@@ -3724,6 +3747,15 @@ class Engine:
             self.emit({"type": "check_done", "count": len(urls), "free": free})
 
         threading.Thread(target=run, name="mox engine checks", daemon=True).start()
+
+    def _probe_once(self, url: str):
+        """probe(), once more through the fallback proxy when the server cannot be reached directly."""
+        try:
+            return probe(unescape_link(url), self.args.headers, self.args.timeout)
+        except RETRYABLE_ERRORS:
+            if not use_fallback(url):
+                raise
+        return probe(unescape_link(url), self.args.headers, self.args.timeout)
 
     def _media_check(self, url: str) -> dict | None:
         """A page as a video, if yt-dlp reads it: its title, length and the qualities on offer."""
@@ -3904,7 +3936,14 @@ def engine_main(argv) -> int:
     parser.set_defaults(**config_defaults())
     args = parser.parse_args(argv)
     check_download_options(parser, args)
-    configure_network(args)
+    if args.proxy or args.fallback_proxy:
+        configure_network(args)
+    else:
+        # With no proxy set, the engine finds a proxy app on this machine (v2rayN, Clash and the
+        # like) and sends through it only the servers it cannot reach directly. Blocked sites,
+        # YouTube among them, then work in the desktop app, which a desktop menu starts without
+        # the HTTP_PROXY a terminal has; everything else still goes direct.
+        enable_auto_fallback()
     Engine(args).run()
     return 0
 

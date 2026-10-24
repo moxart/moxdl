@@ -1703,6 +1703,19 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(self.mox("--video", f"{self.base}/watch?v=3").returncode, 0)
         self.assertEqual(os.path.getsize(os.path.join(self.out, "Clip_ one_two.mp4")), 1000)
 
+    def test_engine_finds_a_proxy_app_later(self):
+        mox = load_mox()
+        found = []
+        mox.find_local_proxy = lambda: found[0] if found else None
+        mox.enable_auto_fallback()  # none running yet: all goes direct
+        self.assertIsNone(mox._fallback)
+        self.assertFalse(mox.use_fallback("https://blocked.test/a"))
+        found.append(f"socks5h://127.0.0.1:{self.socks.server_address[1]}")  # the proxy app starts
+        mox._fallback_looked -= mox.FALLBACK_LOOK_EVERY  # a minute later
+        self.assertTrue(mox.use_fallback("https://blocked.test/a"))  # looked again, found it
+        self.assertTrue(mox.proxied("https://blocked.test/b"))
+        self.assertFalse(mox.proxied("https://elsewhere.test/"))  # the rest stays direct
+
     def test_pick_formats(self):
         mox = load_mox()
         info = {"formats": self.streams() + [
