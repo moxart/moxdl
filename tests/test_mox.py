@@ -179,11 +179,19 @@ args = sys.argv[1:]
 if "--version" in args:
     print("2099.01.01")
     sys.exit(0)
+if os.environ.get("FAKE_FAIL") and "-o" in args:
+    sys.stderr.write("ERROR: this site is unavailable\n")
+    sys.exit(1)
 calls = os.environ.get("FAKE_CALLS")
 n = 0
 if calls:
     n = int(open(calls).read() or 0) if os.path.exists(calls) else 0
     open(calls, "w").write(str(n + 1))
+if "--flat-playlist" in args:  # titles and links only, before -J would describe one video
+    raw = os.environ.get("FAKE_PLAYLIST")
+    entries = json.loads(raw) if raw else [{"url": args[-1], "title": "Clip: one/two"}]
+    print(json.dumps({"_type": "playlist", "entries": entries}))
+    sys.exit(0)
 if "-J" in args:
     streams = json.loads(os.environ["FAKE_STREAMS"])
     if n and os.environ.get("FAKE_STREAMS_AFTER"):
@@ -1026,6 +1034,65 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(mox.Keyboard.names("\x1b[A\x1b[B\x1bOA\r"), ["up", "down", "up", "enter"])
         self.assertEqual(mox.Keyboard.names("\x1b[1;2A]f\x1b[Cz"), ["move up", "move down", "focus"])
         self.assertEqual(mox.Keyboard.names("p xo"), ["pause", "pause", "remove", "open"])
+        self.assertEqual(mox.Keyboard.names("rR"), ["retry", "retry"])
+
+    def test_retry_key_starts_a_failed_download_again(self):
+        mox = load_mox()
+        d = mox.Download(f"{self.base}/big.bin", argparse_namespace(self.out))
+        d.status, d.message = "error", "nope"
+        d.path = os.path.join(self.out, "big.bin")
+        mox._claimed_paths.add(os.path.abspath(d.path))
+        downloads = [d]
+        queue = mox.Scheduler(downloads, 1, mox.RateLimiter(None), threading.Event())
+        display = mox.Display(downloads, stream=io.StringIO(), queue=queue)
+        display.selected = 0
+        mox.handle_keys(["retry"], display, queue)
+        fresh = downloads[0]
+        self.assertIsNot(fresh, d)
+        self.assertEqual((fresh.status, fresh.key), ("waiting", d.key))
+        self.assertNotIn(os.path.abspath(d.path), mox._claimed_paths)
+        display.selected = 0
+        fresh.status = "downloading"
+        mox.handle_keys(["retry"], display, queue)  # only a failed one
+        self.assertIs(downloads[0], fresh)
+
+    def test_blocked_video_site_is_remembered(self):
+        mox = load_mox()
+        os.environ["MOX_YTDLP"] = "yt-dlp"
+        self.addCleanup(os.environ.pop, "MOX_YTDLP", None)
+        mox._fallback = mox.Proxy("socks5h://127.0.0.1:9")
+        opts = argparse_namespace(self.out)
+
+        def answer(args, **kwargs):
+            failed = "example.com" not in args[-1] and "--proxy" not in args
+            class Result:
+                returncode = 1 if failed else 0
+                stdout = "" if failed else '{"title": "T", "formats": []}'
+                stderr = "ERROR: Network is unreachable\n" if failed else ""
+            calls.append(list(args))
+            return Result()
+
+        calls = []
+        with mock.patch.object(mox.subprocess, "run", side_effect=answer):
+            info = mox.media_info("https://example.com/watch?v=1", opts)
+        self.assertEqual(info["title"], "T")  # direct worked: the proxy is not involved
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("--proxy", calls[0])
+        self.assertFalse(mox.proxied("https://example.com/watch?v=1"))
+        calls.clear()
+        with mock.patch.object(mox.subprocess, "run", side_effect=answer):
+            mox.media_info("https://www.youtube.com/watch?v=1", opts)
+        self.assertEqual(len(calls), 2)  # direct failed, then the proxy
+        self.assertIn("--socket-timeout", calls[0])
+        self.assertNotIn("--proxy", calls[0])
+        self.assertIn("--proxy", calls[1])
+        self.assertNotIn("--socket-timeout", calls[1])
+        self.assertTrue(mox.proxied("https://www.youtube.com/watch?v=2"))
+        calls.clear()
+        with mock.patch.object(mox.subprocess, "run", side_effect=answer):
+            mox.media_info("https://www.youtube.com/watch?v=2", opts)
+        self.assertEqual(len(calls), 1)  # remembered: straight to the proxy
+        self.assertIn("--proxy", calls[0])
 
     def test_display_marks_the_selected_row(self):
         mox = load_mox()
@@ -1446,6 +1513,16 @@ class MoxTest(unittest.TestCase):
         # Different files that differ only in the query stay two rows.
         send(cmd="add", urls=[f"{self.base}/get.php?id=1", f"{self.base}/get.php?id=2"])
         self.assertEqual(len(wait_for("added")["ids"]), 2)
+        # The same failed link, added again, starts that row again.
+        send(cmd="add", urls=[f"{self.base}/nope.bin"])
+        nope = wait_for("added")["ids"][0]
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == nope)["status"], "error")
+        send(cmd="add", urls=[f"{self.base}/nope.bin"])
+        self.assertEqual(wait_for("added")["ids"], [])
+        self.assertIn("started again", wait_for("notice")["text"])
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == nope)["status"], "error")
+        send(cmd="retry_all")
+        self.assertIn("started again", wait_for("notice")["text"])
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 
@@ -1703,6 +1780,43 @@ class MoxTest(unittest.TestCase):
         self.assertEqual(self.mox("--video", f"{self.base}/watch?v=3").returncode, 0)
         self.assertEqual(os.path.getsize(os.path.join(self.out, "Clip_ one_two.mp4")), 1000)
 
+    def test_video_ytdlp_error_is_its_own_words(self):
+        self.fake_video_tools([{"format_id": "hls-720", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a",
+                                "height": 720, "protocol": "m3u8_native", "url": f"{self.base}/x.m3u8"}])
+        os.environ["FAKE_FAIL"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_FAIL", None)
+        result = self.mox("--video", f"{self.base}/watch?v=3")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("this site is unavailable", result.stderr)
+
+    @unittest.skipIf(os.name == "nt", "the fake ffmpeg is a shell script")
+    def test_video_playlist(self):
+        self.fake_video_tools(self.streams())
+        os.environ["FAKE_PLAYLIST"] = json.dumps([
+            {"url": f"{self.base}/watch?v=a", "title": "One"},
+            {"url": f"{self.base}/watch?v=b", "title": "Two"}])
+        self.addCleanup(os.environ.pop, "FAKE_PLAYLIST", None)
+        listed = f"{self.base}/playlist?list=1"
+        result = self.mox("--playlist", f"{self.base}/big.bin")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--playlist", result.stderr)
+        result = self.mox("--video", "--playlist", "-o", "one.mp4", listed)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("single video", result.stderr)
+        self.assertEqual(os.listdir(self.out), [])
+        result = self.mox("--video", "--playlist", listed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        names = sorted(n for n in os.listdir(self.out) if not n.endswith((".part", ".mox")))
+        self.assertEqual(names, ["Clip_ one_two (1).mp4", "Clip_ one_two.mp4"])
+        for name in names:
+            self.assertEqual(os.path.getsize(os.path.join(self.out, name)), 2 * SIZE)
+        # No list in the answer: the one page is the one video.
+        os.environ.pop("FAKE_PLAYLIST", None)
+        out = self.temp_dir("mox-one-")
+        result = self.mox("--video", "--playlist", "-d", out, f"{self.base}/watch?v=1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(os.listdir(out)), 1)
+
     def test_engine_finds_a_proxy_app_later(self):
         mox = load_mox()
         found = []
@@ -1755,6 +1869,43 @@ class MoxTest(unittest.TestCase):
         self.assertIn("quality must be", wait_for("error")["text"])
         send(cmd="install", tool="nothing")
         self.assertIn("no such tool", wait_for("error")["text"])
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    @unittest.skipIf(os.name == "nt", "the fake ffmpeg is a shell script")
+    def test_engine_playlist(self):
+        self.fake_video_tools(self.streams())
+        os.environ["FAKE_PLAYLIST"] = json.dumps([
+            {"url": f"{self.base}/watch?v=a", "title": "One"},
+            {"url": f"{self.base}/watch?v=b", "title": "Two"}])
+        self.addCleanup(os.environ.pop, "FAKE_PLAYLIST", None)
+        proc, send, wait_for = self.start_engine()
+        send(cmd="add", urls=[f"{self.base}/playlist?list=1"], media=True, playlist=True)
+        self.assertIn("playlist", wait_for("notice")["text"])
+        ids = wait_for("added")["ids"]
+        self.assertEqual(len(ids), 2)
+        for i in ids:
+            self.assertEqual(wait_for("finished", lambda e, i=i: e["id"] == i)["status"], "done")
+        send(cmd="quit")
+        self.assertEqual(proc.wait(timeout=20), 0)
+
+    @unittest.skipIf(os.name == "nt", "the fake ffmpeg is a shell script")
+    def test_engine_retries_a_failed_video(self):
+        # The first answer names a stream that is not there. Adding the page again, this time
+        # with a header, must start the same video again, not download the page as a file.
+        self.fake_video_tools(self.streams(video="no-such.bin"), after=self.streams())
+        proc, send, wait_for = self.start_engine()
+        page = f"{self.base}/watch?v=9"
+        send(cmd="add", urls=[page], media=True, quality="720")
+        vid = wait_for("added")["ids"][0]
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == vid)["status"], "error")
+        send(cmd="add", urls=[page], media=True, quality="720", headers={"Referer": self.base + "/"})
+        self.assertEqual(wait_for("added")["ids"], [])
+        self.assertIn("started again", wait_for("notice")["text"])
+        self.assertEqual(wait_for("finished", lambda e: e["id"] == vid)["status"], "done")
+        row = wait_for("state", lambda e: any(d["id"] == vid and d["status"] == "done" for d in e["downloads"]))
+        video = next(d for d in row["downloads"] if d["id"] == vid)
+        self.assertEqual((video["media"], video["total"]), (True, 2 * SIZE))
         send(cmd="quit")
         self.assertEqual(proc.wait(timeout=20), 0)
 

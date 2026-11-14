@@ -59,7 +59,8 @@ Some servers gain nothing or refuse extra connections. mox learns that by itself
 - Checks there is room on the disk before a file starts.
 - `--watch` downloads every file link you copy, and `--paste` the links on the clipboard right now, even with text around them.
 - `--page` downloads every file a folder listing links to.
-- Pick what downloads first with the arrow keys while it runs, and watch a video while it downloads.
+- Pick what downloads first with the arrow keys while it runs, retry a failed one with `r`, and watch a video while it downloads.
+- Videos from YouTube and other sites, one video or every video in a playlist.
 - Scheduled downloads, such as 2:00 to 7:00 every night, and shutting down or sleeping when they end.
 - `--sort` saves videos, music, pictures and so on in their own folders, and episodes of a series in a folder per show and season.
 - `--quota` pauses after a set amount, and the history shows how much was downloaded today and in the last 7 and 30 days.
@@ -159,6 +160,7 @@ With several downloads in a run, the arrow keys reorder them while they run:
 | `f` | Only this one, at full speed, until it is done. `f` again shares the speed again |
 | `w` | Download it from the start onward, to watch while it downloads |
 | `p` or Space | Pause just this one, or let it carry on |
+| `r` | Start a failed one again. It keeps what it already has |
 | `x` twice | Take it off the list. Its `.part` stays, to continue later |
 | `o` | Open it: a finished file, or one in watch mode in mpv or VLC |
 
@@ -174,9 +176,12 @@ mox normally fetches pieces from all over a file at once, so a video cannot play
 mox --video https://www.youtube.com/watch?v=...
 mox --video --quality 720 https://www.aparat.com/v/...
 mox --video --quality audio https://www.youtube.com/watch?v=...   # the sound alone
+mox --video --playlist 'https://www.youtube.com/playlist?list=...'
 ```
 
 yt-dlp reads the page and finds the video's streams, for YouTube and about 1800 other sites; mox downloads each stream over many connections, so it is quicker than a single one, resumes, and keeps to `--limit`, `--at` and the rest; then ffmpeg joins the video and the sound into one file. The best quality is taken unless `--quality` caps it, and H.264 in MP4 is preferred at a given height, as every player plays it. When a stream's link expires part way, as YouTube's do after some hours, mox asks the page again and carries on.
+
+`--playlist` downloads every video in a playlist, each as its own file, in the playlist's order. Without it, a link that belongs to a playlist downloads just that one video. Listing the playlist is one quick request; each video is then downloaded like any other.
 
 It needs [yt-dlp](https://github.com/yt-dlp/yt-dlp), recent, since sites change often; for YouTube, a JavaScript runtime ([Deno](https://deno.com) or Node); and ffmpeg for anything better than the one stream that has both video and sound, often 360p. `mox doctor` says what is there and what is old. The desktop app fetches all three in its Settings.
 
@@ -282,7 +287,7 @@ mox --fallback-proxy auto -i links.txt
 mox --fallback-proxy socks5://127.0.0.1:1080 -i links.txt
 ```
 
-`auto` looks for a SOCKS5 proxy on this computer, on the ports v2rayN, xray, Clash, NekoRay and Tor use. Direct here really means direct: the `http_proxy` variables, which proxy apps often set for the whole system, are ignored, and a server switches to the proxy after its first failed connection.
+`auto` looks for a SOCKS5 proxy on this computer, on the ports v2rayN, xray, Clash, NekoRay and Tor use. Direct here really means direct: the `http_proxy` variables, which proxy apps often set for the whole system, are ignored, and a server switches to the proxy after its first failed connection. A site that needed the proxy is remembered for the rest of the run, so the next video from it does not wait on a direct connection that will never answer.
 
 `mox engine`, which the desktop app runs, does this by itself when no proxy is set: a blocked site, YouTube among them, works without a setting, and a proxy app started later is found on the next failure.
 
@@ -344,6 +349,7 @@ Keyword arguments: `name`, `connections`, `limit` (bytes per second, or text suc
 | `--stream` | | Fill files from the start, to watch while they download |
 | `--video` | | The links are pages of a video site, such as YouTube: download the video, through yt-dlp and ffmpeg |
 | `--quality Q` | best | With `--video`: 2160, 1440, 1080, 720, 480, 360, best, or audio for the sound alone |
+| `--playlist` | | With `--video`, every video in a playlist. Without it, just the one video |
 | `-q, --quota SIZE` | none | Pause after this much, such as `5G` |
 | `--then ACTION` | | `shutdown` or `sleep` when the downloads end |
 | `-n, --notify` | | Desktop or Telegram notification when done |
