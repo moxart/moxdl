@@ -25,6 +25,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import struct
@@ -516,6 +517,11 @@ def safe_name(name: str) -> str:
     return name[:200]
 
 
+def title_name(title: str) -> str:
+    """A video title as a file name. Slashes stay in the name: 'AC/DC - Live' is one title."""
+    return safe_name(re.sub(r"[/\\]", "_", title))
+
+
 def filename_from(resp, url: str) -> str:
     disposition = resp.headers.get("Content-Disposition", "")
     name = ""
@@ -774,6 +780,14 @@ class Download:
         with self.lock:
             fresh.segments = [{"start": s["start"], "end": s["end"], "done": s["done"]} for s in self.segments]
         return fresh
+
+    def _release_claim(self) -> None:
+        """Give up the file name, so a fresh copy of this download can take it and carry on.
+        Left claimed, the copy would save as 'name (1)' and start over."""
+        if not self.path:
+            return
+        with _claim_lock:
+            _claimed_paths.discard(os.path.abspath(self.path))
 
     def run(self, stop: threading.Event, limiter: RateLimiter) -> None:
         if stop.is_set():
@@ -1542,8 +1556,12 @@ class Display:
             parts.append(self.notice)
         elif focus is not None:
             parts.append(f"only {clip(focus.name, 24).rstrip()} until it is done · f to share again")
-        elif self.selected is not None and any(d.status not in ("done", "error") for d in self.downloads):
-            parts.append("↑↓ select · Enter next · f only · w watch · p pause · x remove · o open · Ctrl+C stop")
+        elif self.selected is not None and self.downloads:
+            chosen = self.downloads[min(self.selected, len(self.downloads) - 1)]
+            if chosen.status == "error":
+                parts.append("r retries this one · x remove · o open · Ctrl+C stop")
+            elif any(d.status not in ("done", "error") for d in self.downloads):
+                parts.append("↑↓ select · Enter next · f only · w watch · p pause · x remove · o open · Ctrl+C stop")
         elif self.watching:
             parts.append("watching the clipboard for links · Ctrl+C to stop")
         elif any(d.status in ("waiting", "connecting", "downloading") for d in self.downloads):
@@ -1858,6 +1876,9 @@ def parse_args(argv):
     parser.add_argument("--quality", choices=MEDIA_QUALITIES, default="best", metavar="Q",
                         help="with --video: the highest to take, 2160, 1440, 1080, 720, 480 or 360, best (the "
                              "default), or audio for the sound alone")
+    parser.add_argument("--playlist", action="store_true",
+                        help="with --video, download every video in a playlist; without it, a link that is "
+                             "part of a playlist downloads just that one video")
     parser.add_argument("--sha256", metavar="HEX", help="verify the file against this checksum (single URL only)")
     parser.add_argument("--page", action="append", default=[], metavar="URL",
                         help="download the files a web page links to, such as a server's folder listing (repeatable)")
@@ -1907,6 +1928,8 @@ def parse_args(argv):
             sys.exit(0)
     if args.match and not args.page:
         parser.error("--match works with --page")
+    if args.playlist and not args.video:
+        parser.error("--playlist works with --video")
     if args.page and (args.output or args.sha256):
         parser.error("--output and --sha256 work with a single URL only")
     if (len(urls) > 1 or args.watch) and (args.output or args.sha256):
@@ -2350,7 +2373,8 @@ class Keyboard:
     NAMES = {"\x1b[A": "up", "\x1bOA": "up", "\x1b[B": "down", "\x1bOB": "down",
              "\x1b[1;2A": "move up", "\x1b[1;2B": "move down", "[": "move up", "]": "move down",
              "\r": "enter", "\n": "enter", "f": "focus", "F": "focus", "w": "watch", "W": "watch",
-             "p": "pause", "P": "pause", " ": "pause", "x": "remove", "X": "remove", "o": "open", "O": "open"}
+             "p": "pause", "P": "pause", " ": "pause", "r": "retry", "R": "retry",
+             "x": "remove", "X": "remove", "o": "open", "O": "open"}
     WINDOWS_KEYS = {"H": "\x1b[A", "P": "\x1b[B"}  # what msvcrt gives after "\xe0" for the arrows
     TOKEN = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]|\x1bO.|\x1b|.", re.S)
 
@@ -2476,6 +2500,11 @@ def handle_keys(keys: list[str], display: Display, queue: Scheduler) -> None:
                 display.removing = d
         elif key == "open":
             display.say(open_download(d))
+        elif key == "retry" and d.status == "error":
+            d._release_claim()
+            fresh = d.restart()
+            queue.downloads[queue.downloads.index(d)] = fresh
+            display.say(f"retrying {clip(fresh.name, 30).rstrip()}")
         elif key == "up":
             i = max(0, i - 1)
         elif key == "down":
@@ -3152,7 +3181,10 @@ class Engine:
                  then (see the then command), and skip_known: true to leave out files the
                  history has, still on disk, and report them in a "known" event instead
       add also takes media: true, with quality (one of MEDIA_QUALITIES): the links are pages
-                 of a video site, downloaded as video through yt-dlp (see Media)
+                 of a video site, downloaded as video through yt-dlp (see Media). playlist: true
+                 downloads every video in a playlist, each as its own row; without it, one video.
+                 Adding a link that is already there and had failed starts that row again, and a
+                 video stays a video. A fresh signature, or headers, updates the row in place.
       tools      what mox has for video sites, as a "tools" event: yt-dlp's version, the
                  JavaScript runtime, ffmpeg
       install    tool: "yt-dlp", "deno" or "ffmpeg": fetch its latest release into mox's own
@@ -3167,6 +3199,7 @@ class Engine:
       next       id: download it next          move     id, to: put it at that place in the list
       focus      id, or null to share again    stream   id, on: fill it from the start, to watch
       remove     id: off the list, its .part stays     retry   id: start a failed one again
+      retry_all  start every failed download again (ones waiting for disk space retry alone)
       clear      drop finished and failed rows from the list
       open       id: open the file, or its .part in a player when streaming
       reveal     id: open its folder           set      jobs, limit (bytes/s, "2M", or null),
@@ -3610,45 +3643,79 @@ class Engine:
             raise ValueError(f"quality must be one of {', '.join(MEDIA_QUALITIES)}")
         if media and not ytdlp_command():
             raise ValueError("downloading from video sites needs yt-dlp: install it in Settings")
+        if c.get("playlist") and not media:
+            raise ValueError("playlist works with media")
+        if media and c.get("playlist") and "_pages" not in c:
+            # Listing asks the site, and can take a while. On this thread it would stop the
+            # downloads already running, the way a clipboard read used to freeze the app.
+            self.emit({"type": "notice", "text": "reading the playlist"})
+            self._list_playlist(c, opts)
+            return
         skipped = []
-        urls = list(c.get("urls") or [])
-        for line in str(c.get("text") or "").splitlines():  # pasted text, read the way -i reads a file
-            line = line.strip()
-            if line and not line.startswith("#"):
-                urls += urls_in(line) if "://" in line else [line]
-        added, refreshed = [], 0
-        for url in urls:
-            url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
+        pages: list[tuple[str, str | None]] = []
+        if "_pages" in c:
+            for item in c["_pages"]:
+                if isinstance(item, (list, tuple)) and item and isinstance(item[0], str):
+                    title = item[1] if len(item) > 1 and isinstance(item[1], str) else None
+                    pages.append((item[0], title))
+        else:
+            urls = list(c.get("urls") or [])
+            for line in str(c.get("text") or "").splitlines():  # pasted text, read the way -i reads a file
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    urls += urls_in(line) if "://" in line else [line]
+            for url in urls:
+                url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
+                pages.append((url, None))
+        single = len(pages) == 1
+        added, refreshed, restarted = [], 0, 0
+        for url, title in pages:
             same = known.get(file_link(url))
             seen = url if media else link_without_secrets(url)  # a video's page is named by its whole link
             if same is None and seen in have:
                 skipped.append({**have[seen], "url": url})
             elif same is None:
-                name = c.get("name") if len(urls) == 1 else None
+                name = c.get("name") if single else None
                 d = Media(url, opts, quality, name) if media else Download(url, opts, name=name)
+                if media and title and not name:
+                    d.name = title_name(title) or d.name
                 d.then = then
                 self.downloads.append(d)
                 known[file_link(url)] = d
                 added.append(d.key)
-            elif same.url != url or extra:
+            elif same.url != url or extra or same.status == "error":
                 # The same file under a fresh link: download sites sign each link anew, so a list
                 # copied twice came back as a second row that downloaded the file again, as
                 # "name (1)". The fresh link replaces the old one instead, and restarts the row
-                # if the old link had failed, as an expired one does. Headers that come with it,
-                # the browser's login after a try without it, replace the row's own.
-                refreshed += 1
+                # if the old link had failed, as an expired one does. The same failed link, added
+                # again, starts again too. Headers that come with it, the browser's login after a
+                # try without it, replace the row's own. A video stays a video.
+                changed = same.url != url or bool(extra)
                 row_opts = argparse.Namespace(**{**vars(same.opts), "headers": {**self.args.headers, **extra},
                                                  "extra_headers": extra}) if extra else same.opts
+                old = file_link(same.url)
                 if same.status == "error":
-                    fresh = Download(url, row_opts, same.custom_name, same.sha256)
-                    fresh.key, fresh.dir, fresh.stream, fresh.held = same.key, same.dir, same.stream, same.held
-                    self.downloads[self.downloads.index(same)] = fresh
-                    self.announced.discard(same.key)
+                    same.url, same.opts = url, row_opts
+                    if isinstance(same, Media):
+                        same.page = url
+                        if c.get("quality"):
+                            same.quality = quality
+                    fresh = self._revive(same)
+                    if old != file_link(url):
+                        known.pop(old, None)
                     known[file_link(url)] = fresh
+                    restarted += 1
                 else:
                     same.url, same.opts = url, row_opts  # used from its next connection, and saved
+                    if isinstance(same, Media):
+                        same.page = url
                     if same.status == "waiting":
                         same.final_url = url
+                    if old != file_link(url):
+                        known.pop(old, None)
+                        known[file_link(url)] = same
+                if changed:
+                    refreshed += 1
         if c.get("first"):
             # Ahead of everything waiting, in the order given, as "download next" does for one.
             front = self.queue.front()
@@ -3659,9 +3726,31 @@ class Engine:
         self.emit({"type": "added", "ids": added})
         if skipped:
             self.emit({"type": "known", "items": skipped})
-        if refreshed:
+        if restarted:
+            # Starting again is the part worth saying. The new link or headers went with it.
+            self.emit({"type": "notice", "text": f"{restarted} failed "
+                                                 f"{'download' if restarted == 1 else 'downloads'} started again"})
+        elif refreshed:
             self.emit({"type": "notice", "text": f"{refreshed} already in the list: "
                                                  f"{'its link was' if refreshed == 1 else 'their links were'} updated"})
+
+    def _list_playlist(self, c: dict, opts) -> None:
+        def expand() -> None:
+            try:
+                urls = list(c.get("urls") or [])
+                for line in str(c.get("text") or "").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        urls += urls_in(line) if "://" in line else [line]
+                pages = []
+                for url in urls:
+                    url = unescape_link(url.strip() if "://" in url else "https://" + url.strip())
+                    pages += [list(item) for item in playlist_entries(url, opts)]
+                self.commands.put(json.dumps({**c, "_pages": pages}))
+            except FatalError as e:
+                self.emit({"type": "error", "text": str(e)})
+                self.emit({"type": "added", "ids": []})  # the add is over; a client waiting on it can stop
+        threading.Thread(target=expand, name="mox playlist", daemon=True).start()
 
     def _known_files(self) -> dict:
         """Files downloaded before and still where they were saved, by their link without its
@@ -3827,12 +3916,29 @@ class Engine:
     def cmd_remove(self, c: dict) -> None:
         self.queue.remove(self.find(c["id"]))
 
+    def _revive(self, d: Download) -> Download:
+        """A failed download, started again: same id and place, and its .part carries on."""
+        d._release_claim()
+        fresh = d.restart()
+        self.downloads[self.downloads.index(d)] = fresh
+        self.announced.discard(d.key)
+        return fresh
+
     def cmd_retry(self, c: dict) -> None:
         d = self.find(c["id"])
         if d.status == "error":
-            fresh = d.restart()
-            self.downloads[self.downloads.index(d)] = fresh
-            self.announced.discard(d.key)
+            self._revive(d)
+
+    def cmd_retry_all(self, c: dict) -> None:
+        # Out of space retries itself once there is room; the others had given up.
+        failed = [d for d in list(self.downloads) if d.status == "error" and d.error_status != "space"]
+        for d in failed:
+            self._revive(d)
+        if failed:
+            self.emit({"type": "notice", "text": f"{len(failed)} failed "
+                                                 f"{'download' if len(failed) == 1 else 'downloads'} started again"})
+        else:
+            self.emit({"type": "notice", "text": "nothing failed"})
 
     def cmd_clear(self, c: dict) -> None:
         self.downloads[:] = [d for d in self.downloads if d.status not in ("done", "error")]
@@ -4133,6 +4239,7 @@ def download(url: str, directory: str = ".", *, name: str | None = None,
 # None of the three is needed for anything else, so mox only looks for them when asked to.
 MEDIA_QUALITIES = ("best", "2160", "1440", "1080", "720", "480", "360", "audio")
 MEDIA_TIMEOUT = 120   # seconds yt-dlp may take to read a page
+DIRECT_TRY = 10       # seconds a direct try may sit idle when a fallback proxy can take over
 MEDIA_REFRESHES = 3   # times a stream's link may be asked for afresh when it expires part way
 YTDLP_STALE_DAYS = 60  # older than this, a yt-dlp has often stopped working with YouTube
 DIRECT = ("http", "https")  # the streams mox downloads itself; others (HLS) go to yt-dlp
@@ -4206,31 +4313,85 @@ def _ytdlp_args(opts, proxy: str | None) -> list:
     return args
 
 
+def _media_proxies(url: str, opts) -> list:
+    """Proxies to try, in order. None is a direct connection. A host that already needed the
+    fallback proxy is not asked directly again."""
+    proxy = getattr(opts, "proxy", None)
+    if proxy:
+        return [proxy]
+    if _fallback is not None and proxied(url):
+        return [_fallback.url]
+    if _fallback is not None:
+        return [None, _fallback.url]
+    return [None]
+
+
+def _ytdlp_json(url: str, opts, extra: list) -> dict:
+    """yt-dlp's JSON for a page. The first direct failure is remembered, so the next video from
+    that site goes through the fallback proxy at once instead of waiting out another timeout."""
+    message = "the video site did not answer"
+    for proxy in _media_proxies(url, opts):
+        args = _ytdlp_args(opts, proxy) + list(extra)
+        if proxy is None and _fallback is not None:
+            # Idle timeout, not a cap on a page that is answering. A filtered site never sends a
+            # byte, and yt-dlp would otherwise retry until MEDIA_TIMEOUT on every video.
+            args += ["--socket-timeout", str(DIRECT_TRY)]
+        args.append(url)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    timeout=MEDIA_TIMEOUT, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            message = "the video site took too long to answer"
+        except OSError as e:
+            raise FatalError(f"could not run yt-dlp: {e}") from None
+        else:
+            if result.returncode == 0 and result.stdout.strip():
+                try:
+                    return json.loads(result.stdout)
+                except ValueError:
+                    message = "yt-dlp said something mox could not read"
+            else:
+                lines = [line for line in result.stderr.splitlines() if line.strip()]
+                message = (lines[-1] if lines else f"yt-dlp exited with {result.returncode}").replace("ERROR: ", "")
+        if proxy is None and _fallback is not None:
+            use_fallback(url)
+    raise FatalError(message[:300])
+
+
 def media_info(url: str, opts) -> dict:
     """What yt-dlp says of a page: title, and every stream with its link and size. Tried through
     --fallback-proxy too when the direct way fails, as YouTube is blocked in some countries."""
-    proxies = [getattr(opts, "proxy", None)]
-    if not proxies[0] and _fallback:
-        proxies.append(_fallback.url)
-    for proxy in proxies:
-        try:
-            result = subprocess.run(_ytdlp_args(opts, proxy) + ["-J", "--no-playlist", url], capture_output=True,
-                                    text=True, encoding="utf-8", errors="replace", timeout=MEDIA_TIMEOUT,
-                                    stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
-        except subprocess.TimeoutExpired:
-            message = "the video site took too long to answer"
+    return _ytdlp_json(url, opts, ["-J", "--no-playlist"])
+
+
+def _entry_page(entry: dict) -> str | None:
+    for key in ("webpage_url", "original_url", "url"):
+        value = entry.get(key)
+        if isinstance(value, str) and "://" in value:
+            return value
+    return None
+
+
+def playlist_entries(url: str, opts) -> list[tuple[str, str | None]]:
+    """(page, title) for each video in a playlist, from one quick listing. A page that is a single
+    video comes back as itself, so --playlist on a watch link still downloads that one."""
+    info = _ytdlp_json(url, opts, ["-J", "--flat-playlist", "--yes-playlist"])
+    entries = info.get("entries") if isinstance(info, dict) else None
+    if not isinstance(entries, list) or info.get("_type") != "playlist":
+        return [(url, None)]
+    found, seen = [], set()
+    for entry in entries:
+        if not isinstance(entry, dict):
             continue
-        except OSError as e:
-            raise FatalError(f"could not run yt-dlp: {e}") from None
-        if result.returncode == 0 and result.stdout.strip():
-            try:
-                return json.loads(result.stdout)
-            except ValueError:
-                message = "yt-dlp said something mox could not read"
-                continue
-        lines = [line for line in result.stderr.splitlines() if line.strip()]
-        message = (lines[-1] if lines else f"yt-dlp exited with {result.returncode}").replace("ERROR: ", "")
-    raise FatalError(message[:300])
+        page = _entry_page(entry)
+        if not page or page in seen:
+            continue
+        seen.add(page)
+        title = entry.get("title")
+        found.append((page, title.strip() if isinstance(title, str) and title.strip() else None))
+    if not found:
+        raise FatalError("the playlist has no videos")
+    return found
 
 
 def _media_streams(info: dict) -> list:
@@ -4324,6 +4485,7 @@ class Media(Download):
         if not name:
             self.name = urllib.parse.urlsplit(page).hostname or page  # until the site says the title
         self.part: Download | None = None  # the stream downloading now
+        self.part_paths: list[str] = []  # stream files, so a retry can take their names back
         self.part_sizes: list[int] = []
         self.part_index = 0
 
@@ -4331,6 +4493,18 @@ class Media(Download):
         fresh = Media(self.page, self.opts, self.quality, self.custom_name)
         fresh.key, fresh.dir, fresh.held, fresh.then = self.key, self.dir, self.held, self.then
         return fresh
+
+    def _release_claim(self) -> None:
+        super()._release_claim()
+        self._release_parts()
+
+    def _release_parts(self) -> None:
+        paths = list(self.part_paths)
+        if self.part and self.part.path:
+            paths.append(self.part.path)
+        with _claim_lock:
+            for path in paths:
+                _claimed_paths.discard(os.path.abspath(path))
 
     def pieces(self) -> list[tuple[int, int]]:
         out, offset = [], 0
@@ -4345,8 +4519,7 @@ class Media(Download):
     def _run(self, stop, limiter):
         self.status, self.message = "connecting", "asking the site"
         info = media_info(self.page, self.opts)
-        # A title is a name, not a path: "AC/DC - Live" keeps both its halves.
-        title = safe_name(re.sub(r"[/\\]", "_", info.get("title") or "")) or "video"
+        title = title_name(info.get("title") or "") or "video"
         streams, ext = pick_formats(info, self.quality, ffmpeg_command() is not None)
         if not self.custom_name:
             self.name = f"{title}.{ext or ('m4a' if self.quality == 'audio' else 'mp4')}"
@@ -4370,6 +4543,7 @@ class Media(Download):
             self.part_sizes[i] = os.path.getsize(got)
         self.part_index, self.part = len(streams), None
         self._join(files)
+        self._release_parts()  # the stream files are gone; their names must not stay taken
         self.done = self.total = os.path.getsize(self.path)
         self.status, self.message = "done", ""
         if getattr(self.opts, "history", False):
@@ -4396,6 +4570,8 @@ class Media(Download):
                 self.status = "downloading" if part.status == "downloading" else self.status
                 self.message = part.message if part.status != "downloading" or part.message else ""
             if part.status == "done":
+                if part.path:
+                    self.part_paths.append(part.path)
                 return part.path
             if stop.is_set() or part.status == "paused":
                 return None
@@ -4434,23 +4610,46 @@ class Media(Download):
             self._remove(path)
 
     def _run_with_ytdlp(self, stop) -> None:
-        """Streams mox cannot download itself, such as HLS: yt-dlp downloads them, many pieces
-        at once, and mox follows its progress. Stopped, it keeps its .part to carry on from."""
+        """Streams mox cannot download itself, such as HLS. Direct first, then the fallback proxy
+        once, and that host goes through the proxy from then on."""
+        message = "the video site did not answer"
+        for proxy in _media_proxies(self.page, self.opts):
+            try:
+                self._ytdlp_once(stop, proxy)
+            except FatalError as e:
+                message = str(e)
+                if stop.is_set() or proxy is not None or _fallback is None:
+                    raise
+                use_fallback(self.page)
+                continue
+            return
+        raise FatalError(message[:300])
+
+    def _ytdlp_once(self, stop, proxy) -> None:
+        """One yt-dlp download. Stopped, it keeps its .part to carry on from."""
         height = "" if self.quality in ("best", "audio") else f"[height<={self.quality}]"
         pick = "ba/b" if self.quality == "audio" else f"bv*{height}+ba/b{height}/b"
-        args = _ytdlp_args(self.opts, getattr(self.opts, "proxy", None) or (_fallback.url if _fallback else None))
         template = ("download:mox %(progress.downloaded_bytes)s %(progress.total_bytes)s "
                     "%(progress.total_bytes_estimate)s")
-        process = subprocess.Popen(args + ["-f", pick, "-N", "8", "--no-playlist", "--newline", "-o", self.path,
-                                          "--progress-template", template, self.page],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                   text=True, errors="replace", creationflags=NO_WINDOW)
+        args = _ytdlp_args(self.opts, proxy) + [
+            "-f", pick, "-N", "8", "--no-playlist", "--newline", "-o", self.path, "--progress-template", template]
+        if proxy is None and _fallback is not None:
+            args += ["--socket-timeout", str(DIRECT_TRY)]
+        process = subprocess.Popen(
+            args + [self.page], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            text=True, errors="replace", start_new_session=os.name != "nt", creationflags=NO_WINDOW)
         self.status, self.message = "downloading", ""
         errors: list[str] = []
-        threading.Thread(target=lambda: errors.extend(process.stderr), daemon=True).start()
+
+        def read_err() -> None:
+            if process.stderr is not None:
+                errors.extend(process.stderr)
+
+        thread = threading.Thread(target=read_err, name="mox yt-dlp", daemon=True)
+        thread.start()
         for line in process.stdout:
             if stop.is_set():
-                process.terminate()
+                stop_process(process)
                 break
             words = line.split()
             if words[:1] == ["mox"] and len(words) == 4:
@@ -4458,16 +4657,31 @@ class Media(Download):
                 self.done = numbers[0] or self.done
                 self.total = numbers[1] or numbers[2] or self.total
         process.wait()
+        thread.join(timeout=5)  # the error text is on stderr; reading it later loses the last lines
         if stop.is_set():
             self.status = "paused"
             return
         if process.returncode != 0 or not os.path.exists(self.path):
-            message = next((e.strip() for e in reversed(errors) if e.strip()), f"yt-dlp exited with {process.returncode}")
+            message = next((e.strip() for e in reversed(errors) if e.strip()),
+                           f"yt-dlp exited with {process.returncode}")
             raise FatalError(message.replace("ERROR: ", "")[:300])
         self.done = self.total = os.path.getsize(self.path)
         self.status = "done"
         if getattr(self.opts, "history", False):
             record_history(self)
+
+
+def stop_process(process: subprocess.Popen) -> None:
+    """End a helper and the tools it started. terminate() alone leaves yt-dlp's ffmpeg running."""
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+            return
+        except OSError:
+            pass
+    process.terminate()
 
 
 # What mox can fetch for itself, from each project's own releases, checked against the checksums
@@ -4616,8 +4830,36 @@ def run_command(argv) -> int:
     if args.video and not ytdlp_command():
         print("✖ --video needs yt-dlp: 'mox doctor' says how to get it", file=sys.stderr)
         return 2
-    downloads = [Media(url, args, args.quality, name=args.output) if args.video else
-                 Download(url, args, name=args.output, sha256=args.sha256) for url in args.urls]
+    titles: dict[str, str] = {}
+    if args.video and args.playlist:
+        expanded, seen = [], set()
+        for url in args.urls:
+            try:
+                entries = playlist_entries(url, args)
+            except FatalError as e:
+                print(f"✖ {url}: {e}", file=sys.stderr)
+                return 1
+            for page, title in entries:
+                if page in seen:
+                    continue
+                seen.add(page)
+                expanded.append(page)
+                if title:
+                    titles[page] = title
+        if len(expanded) != 1 and (args.output or args.sha256):
+            print(f"✖ --output and --sha256 work with a single video, and this playlist has "
+                  f"{len(expanded)}.", file=sys.stderr)
+            return 2
+        args.urls = expanded
+    downloads = []
+    for url in args.urls:
+        if args.video:
+            d = Media(url, args, args.quality, name=args.output)
+            if not args.output and url in titles:
+                d.name = title_name(titles[url]) or d.name
+            downloads.append(d)
+        else:
+            downloads.append(Download(url, args, name=args.output, sha256=args.sha256))
     if not args.watch:
         return run_downloads(downloads, args)
     command = clipboard_command()
